@@ -14,6 +14,9 @@ workflows:
     scripts:
       - name: Install dependencies
         script: npm install
+      - name: Sync app icon to iOS project
+        script: |
+          cp assets/icon.png ios/ForgeLite/Images.xcassets/AppIcon.appiconset/App-Icon-1024x1024@1x.png
       - name: Install pods
         script: |
           cd ios
