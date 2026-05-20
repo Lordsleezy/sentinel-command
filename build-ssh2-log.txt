@@ -1,0 +1,64 @@
+★ eas-cli@19.0.1 is now available.
+To upgrade, run:
+npm install -g eas-cli
+Proceeding with outdated version.
+
+Resolved "preview" environment for the build. Learn more: https://docs.expo.dev/eas/environment-variables/#setting-the-environment-for-your-builds
+No environment variables with visibility "Plain text" and "Sensitive" found for the "preview" environment on EAS.
+
+
+
+✔ Using remote iOS credentials (Expo server)
+
+Distribution Certificate is not validated for non-interactive builds.
+Skipping Provisioning Profile validation on Apple Servers because we aren't authenticated.
+
+Project Credentials Configuration
+
+Project                   @lordsleezy/forge-lite
+Bundle Identifier         org.sentinelprime.forgelite
+                          
+Ad Hoc Configuration      
+                          
+Distribution Certificate  
+Serial Number             163AF7E8FF0EEA9E14A4C67618B1513A
+Expiration Date           Wed, 05 May 2027 23:07:14 PDT
+Apple Team                4SRR4NV35F (PAUL GREGORY GREEN (Individual))
+Updated                   13 days ago
+                          
+Provisioning Profile      
+Developer Portal ID       FJZ38K8UZA
+Status                    active
+Expiration                Wed, 05 May 2027 23:07:14 PDT
+Apple Team                4SRR4NV35F (PAUL GREGORY GREEN (Individual))
+Provisioned devices       - iPhone (UDID: 00008130-001671902140001C)
+Updated                   1 hour ago
+                          
+All credentials are ready to build @lordsleezy/forge-lite (org.sentinelprime.forgelite)
+
+
+Compressing project files and uploading to EAS Build. Learn more: https://expo.fyi/eas-build-archive
+- Uploading to EAS Build (0 / 1.Failed to upload metadata to EAS Build
+
+Reason: zlib: Cannot create a Buffer larger than 4294967296 bytes
+- Uploading to EAS Build (0 / 69.7 MB)
+✔ Uploaded to EAS 52s
+- Computing project fingerprint
+⌛️ Computing the project fingerprint is taking longer than expected...
+⏩ To skip this step, set the environment variable: EAS_SKIP_AUTO_FINGERPRINT=1
+✔ Computed project fingerprint
+
+See logs: https://expo.dev/accounts/lordsleezy/projects/forge-lite/builds/043d1e7c-645b-4014-b4c0-fe5a16992c41
+
+Waiting for build to complete. You can press Ctrl+C to exit.
+- Waiting for build to complete.
+✖ Build failed
+
+🍏 iOS build failed:
+We've lost connection to the worker.
+
+Two common reasons:
+1. Worker ran out of memory.
+   Try running your build on a large worker. Learn more at https://docs.expo.dev/build/eas-json/#selecting-resource-class
+2. Worker experienced a network issue.
+   This is most likely an intermittent problem. Try running the build again.

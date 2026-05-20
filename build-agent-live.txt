@@ -1,0 +1,19 @@
+(node:804389) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+Resolved "preview" environment for the build. [2mLearn more: [4mhttps://docs.expo.dev/eas/environment-variables/#setting-the-environment-for-your-builds[24m[22m
+No environment variables with visibility "Plain text" and "Sensitive" found for the "preview" environment on EAS.
+
+
+
+[32m[32m✔[39m[32m[39m Using remote iOS credentials [2m(Expo server)[22m
+
+[32mIf you provide your Apple account credentials we will be able to generate all necessary build credentials and fully validate them.[39m
+[32mThis is optional, but without Apple account access you will need to provide all the missing values manually and we can only run minimal validation on them.[39m
+[?25l[2K[1G[36m?[39m [1mDo you want to log in to your Apple account?[22m [90m›[39m [90m(Y/n)[39m[2K[G[2K[1G[32m✔[39m [1mDo you want to log in to your Apple account?[22m [90m…[39m yes
+[?25hy
+
+› Log in to your Apple Developer account to continue
+[2K[1G[36m?[39m [1mApple ID:[22m [90m›[39m 78[2K[G[2K[1G[36m?[39m [1mApple ID:[22m [90m›[39m y78[2K[G[2K[1G[32m✔[39m [1mApple ID:[22m [90m…[39m y78
+[?25h[1m› The password is only used to authenticate with Apple and never stored on EAS servers[22m
+  [2mLearn more: [4mhttps://bit.ly/2VtGWhU[24m[22m
+[2K[1G[36m?[39m [1mPassword (for y):[22m [90m›[39m 78
