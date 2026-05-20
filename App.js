@@ -1,22 +1,26 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  InputAccessoryView,
+  Keyboard,
   KeyboardAvoidingView,
   Platform,
+  Pressable,
   ScrollView,
   StyleSheet,
   Text,
   TextInput,
+  View,
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import SSHClient from '@dylankenneally/react-native-ssh-sftp';
 
 const PROMPT = 'PS > ';
-const BG = '#012456';
+const INPUT_ACCESSORY_ID = 'forge-lite-keyboard-dismiss';
+const BG = '#000000';
 const FG = '#CCCCCC';
 const MAX_HISTORY = 50;
 
 const STARTUP_TEXT =
-  'Windows PowerShell\n' +
   'Copyright (C) Sentinel Prime. All rights reserved.\n\n' +
   'Install the latest Sentinel: https://sentinelprime.org\n\n' +
   PROMPT;
@@ -265,6 +269,19 @@ export default function App() {
         </Text>
       </ScrollView>
 
+      {Platform.OS === 'ios' ? (
+        <InputAccessoryView nativeID={INPUT_ACCESSORY_ID}>
+          <View style={styles.keyboardAccessory}>
+            <Pressable
+              onPress={() => Keyboard.dismiss()}
+              style={styles.keyboardDoneButton}
+            >
+              <Text style={styles.keyboardDoneText}>Done</Text>
+            </Pressable>
+          </View>
+        </InputAccessoryView>
+      ) : null}
+
       <TextInput
         ref={inputRef}
         style={styles.hiddenInput}
@@ -278,6 +295,9 @@ export default function App() {
         keyboardType="ascii-capable"
         secureTextEntry={mode === 'password'}
         contextMenuHidden={mode === 'password'}
+        inputAccessoryViewID={
+          Platform.OS === 'ios' ? INPUT_ACCESSORY_ID : undefined
+        }
       />
     </KeyboardAvoidingView>
   );
@@ -309,5 +329,23 @@ const styles = StyleSheet.create({
     backgroundColor: BG,
     fontFamily: MONO_FONT,
     fontSize: 14,
+  },
+  keyboardAccessory: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    backgroundColor: '#1c1c1e',
+    borderTopWidth: 1,
+    borderTopColor: '#3a3a3c',
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+  },
+  keyboardDoneButton: {
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+  },
+  keyboardDoneText: {
+    color: '#0a84ff',
+    fontSize: 17,
+    fontWeight: '600',
   },
 });
