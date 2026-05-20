@@ -1,0 +1,36 @@
+workflows:
+  ios-internal:
+    name: Forge Lite iOS Internal
+    max_build_duration: 60
+    environment:
+      ios_signing:
+        distribution_type: ad_hoc
+        bundle_identifier: org.sentinelprime.forgelite
+      vars:
+        BUNDLE_ID: org.sentinelprime.forgelite
+      node: latest
+      xcode: latest
+      cocoapods: default
+    scripts:
+      - name: Install dependencies
+        script: npm install
+      - name: Install pods
+        script: |
+          cd ios
+          pod install
+      - name: Build iOS
+        script: |
+          xcode-project use-profiles
+          xcode-project build-ipa \
+            --workspace ios/ForgeLite.xcworkspace \
+            --scheme ForgeLite
+    artifacts:
+      - build/ios/ipa/*.ipa
+      - /tmp/xcodebuild_logs/*.log
+    publishing:
+      email:
+        recipients:
+          - pgg124@gmail.com
+        notify:
+          success: true
+          failure: true
