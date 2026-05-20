@@ -11,18 +11,28 @@ import {
   TextInput,
   View,
 } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as DocumentPicker from 'expo-document-picker';
+import * as FileSystem from 'expo-file-system/legacy';
 import { StatusBar } from 'expo-status-bar';
 import SSHClient from '@dylankenneally/react-native-ssh-sftp';
 
 const PROMPT = 'PS > ';
 const INPUT_ACCESSORY_ID = 'forge-lite-keyboard-dismiss';
+const STORAGE_KEY = 'forge_lite_ssh_keys';
 const BG = '#000000';
 const FG = '#CCCCCC';
 const MAX_HISTORY = 50;
 
 const STARTUP_TEXT =
+  'Forge Lite v1.0\n' +
   'Copyright (C) Sentinel Prime. All rights reserved.\n\n' +
   'Install the latest Sentinel: https://sentinelprime.org\n\n' +
+  'Commands:\n' +
+  '  ssh user@host        Connect to a remote machine\n' +
+  '  ssh-add              Import an SSH private key\n' +
+  '  ssh-keys             List stored keys\n' +
+  "  ssh-remove [n]       Remove a stored key\n\n" +
   PROMPT;
 
 const MONO_FONT = Platform.select({
@@ -30,6 +40,30 @@ const MONO_FONT = Platform.select({
   android: 'monospace',
   default: 'monospace',
 });
+
+function formatKeyDate(iso) {
+  const date = new Date(iso);
+  return date.toLocaleDateString('en-US', {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+  });
+}
+
+async function loadStoredKeys() {
+  const raw = await AsyncStorage.getItem(STORAGE_KEY);
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+async function saveStoredKeys(keys) {
+  await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(keys));
+}
 
 function parseSshCommand(line) {
   const trimmed = line.trim();
@@ -67,6 +101,12 @@ function parseSshCommand(line) {
   }
 
   return { type: 'ok', username, host, port };
+}
+
+function parseRemoveIndex(line) {
+  const match = line.trim().match(/^ssh-remove(?:\s+(\d+))?$/i);
+  if (!match) return null;
+  return match[1] ? parseInt(match[1], 10) : null;
 }
 
 export default function App() {
@@ -136,24 +176,163 @@ export default function App() {
     setInput('');
   }, []);
 
-  const connectSSH = useCallback(
-    async ({ username, host, port }, password) => {
-      const client = await SSHClient.connectWithPassword(
-        host,
-        port,
-        username,
-        password,
-      );
-
+  const establishShell = useCallback(
+    async (client) => {
       client.on('Shell', (data) => {
         if (data) appendOutput(data);
       });
-
       await client.startShell('vanilla');
       sshClientRef.current = client;
       setMode('ssh');
       setPending(null);
       setInput('');
+    },
+    [appendOutput],
+  );
+
+  const connectWithPassword = useCallback(
+    async (target, password) => {
+      const client = await SSHClient.connectWithPassword(
+        target.host,
+        target.port,
+        target.username,
+        password,
+      );
+      await establishShell(client);
+    },
+    [establishShell],
+  );
+
+  const connectWithKey = useCallback(
+    async (target, privateKey, passphrase = '') => {
+      const client = await SSHClient.connectWithKey(
+        target.host,
+        target.port,
+        target.username,
+        privateKey,
+        passphrase,
+      );
+      await establishShell(client);
+    },
+    [establishShell],
+  );
+
+  const beginSshConnect = useCallback(
+    async (target) => {
+      const keys = await loadStoredKeys();
+
+      if (keys.length > 0) {
+        appendOutput(`Connecting to ${target.host}:${target.port}...\n`);
+
+        for (const stored of keys) {
+          try {
+            await connectWithKey(target, stored.key);
+            return;
+          } catch {
+            /* try next key */
+          }
+        }
+
+        setPending({ ...target, keyAuthFailed: true });
+        setMode('password');
+        appendOutput(
+          `Key auth failed. Password for ${target.username}@${target.host}: `,
+        );
+        return;
+      }
+
+      setPending(target);
+      setMode('password');
+      appendOutput(`${target.username}@${target.host}'s password: `);
+    },
+    [appendOutput, connectWithKey],
+  );
+
+  const importSshKey = useCallback(async () => {
+    Keyboard.dismiss();
+
+    try {
+      const result = await DocumentPicker.getDocumentAsync({
+        type: '*/*',
+        copyToCacheDirectory: true,
+        multiple: false,
+      });
+
+      if (result.canceled || !result.assets?.length) {
+        appendOutput('ssh-add: cancelled\n\n');
+        appendOutput(PROMPT);
+        return;
+      }
+
+      const asset = result.assets[0];
+      const keyMaterial = await FileSystem.readAsStringAsync(asset.uri);
+
+      if (
+        !keyMaterial.includes('BEGIN') &&
+        !keyMaterial.includes('PRIVATE KEY')
+      ) {
+        appendOutput('ssh-add: file does not look like a private key\n\n');
+        appendOutput(PROMPT);
+        return;
+      }
+
+      const keys = await loadStoredKeys();
+      const name = asset.name || 'id_rsa';
+      keys.push({
+        name,
+        key: keyMaterial.trim(),
+        addedAt: new Date().toISOString(),
+      });
+      await saveStoredKeys(keys);
+
+      appendOutput(`Identity added: ${name}\n\n`);
+      appendOutput(PROMPT);
+    } catch (err) {
+      const message = err?.message || String(err);
+      appendOutput(`ssh-add: ${message}\n\n`);
+      appendOutput(PROMPT);
+    }
+  }, [appendOutput]);
+
+  const listSshKeys = useCallback(async () => {
+    const keys = await loadStoredKeys();
+
+    if (keys.length === 0) {
+      appendOutput('No stored keys.\n\n');
+      appendOutput(PROMPT);
+      return;
+    }
+
+    appendOutput('Stored keys:\n');
+    keys.forEach((entry, index) => {
+      appendOutput(
+        `  ${index + 1}. ${entry.name} (added ${formatKeyDate(entry.addedAt)})\n`,
+      );
+    });
+    appendOutput("Type 'ssh-remove 1' to remove a key.\n\n");
+    appendOutput(PROMPT);
+  }, [appendOutput]);
+
+  const removeSshKey = useCallback(
+    async (index) => {
+      const keys = await loadStoredKeys();
+
+      if (index == null || Number.isNaN(index)) {
+        appendOutput('ssh-remove: missing index. Use: ssh-remove 1\n\n');
+        appendOutput(PROMPT);
+        return;
+      }
+
+      if (index < 1 || index > keys.length) {
+        appendOutput(`ssh-remove: invalid index ${index}\n\n`);
+        appendOutput(PROMPT);
+        return;
+      }
+
+      const removed = keys.splice(index - 1, 1)[0];
+      await saveStoredKeys(keys);
+      appendOutput(`Removed key: ${removed.name}\n\n`);
+      appendOutput(PROMPT);
     },
     [appendOutput],
   );
@@ -167,13 +346,16 @@ export default function App() {
 
       if (!target) {
         setMode('local');
+        appendOutput(PROMPT);
         return;
       }
 
-      appendOutput(`Connecting to ${target.host}:${target.port}...\n`);
+      if (!target.keyAuthFailed) {
+        appendOutput(`Connecting to ${target.host}:${target.port}...\n`);
+      }
 
       try {
-        await connectSSH(target, password);
+        await connectWithPassword(target, password);
       } catch (err) {
         const message = err?.message || String(err);
         appendOutput(`\nError: ${message}\n\n${PROMPT}`);
@@ -213,15 +395,31 @@ export default function App() {
       return;
     }
 
+    const lower = trimmed.toLowerCase();
+
+    if (lower === 'ssh-add') {
+      await importSshKey();
+      return;
+    }
+
+    if (lower === 'ssh-keys') {
+      await listSshKeys();
+      return;
+    }
+
+    const removeIndex = parseRemoveIndex(trimmed);
+    if (removeIndex !== null || lower === 'ssh-remove') {
+      await removeSshKey(removeIndex);
+      return;
+    }
+
     const parsed = parseSshCommand(line);
     if (parsed.type === 'ok') {
-      setPending({
+      await beginSshConnect({
         username: parsed.username,
         host: parsed.host,
         port: parsed.port,
       });
-      setMode('password');
-      appendOutput(`${parsed.username}@${parsed.host}'s password: `);
       return;
     }
 
@@ -231,7 +429,7 @@ export default function App() {
       return;
     }
 
-    if (parsed.type === 'invalid' || trimmed.toLowerCase().startsWith('ssh')) {
+    if (parsed.type === 'invalid' || lower.startsWith('ssh')) {
       appendOutput('ssh: invalid syntax. Use: ssh user@host\n\n');
       appendOutput(PROMPT);
       return;
@@ -245,9 +443,13 @@ export default function App() {
     pending,
     appendOutput,
     pushHistory,
-    connectSSH,
+    connectWithPassword,
     disconnect,
     writeToShell,
+    importSshKey,
+    listSshKeys,
+    removeSshKey,
+    beginSshConnect,
   ]);
 
   return (
