@@ -2,56 +2,35 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   KeyboardAvoidingView,
   Platform,
-  Pressable,
   ScrollView,
   StyleSheet,
   Text,
   TextInput,
-  View,
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import SSHClient from '@dylankenneally/react-native-ssh-sftp';
 
-const APP_VERSION = '1.0';
-const PROMPT = '> ';
-const BG = '#000000';
-const FG = '#f0f0f0';
+const PROMPT = 'PS > ';
+const BG = '#012456';
+const FG = '#CCCCCC';
 const MAX_HISTORY = 50;
 
 const STARTUP_TEXT =
-  `Forge Lite v${APP_VERSION}\n` +
-  "Type 'ssh user@host' to connect.\n\n";
+  'Windows PowerShell\n' +
+  'Copyright (C) Sentinel Prime. All rights reserved.\n\n' +
+  'Install the latest Sentinel: https://sentinelprime.org\n\n' +
+  PROMPT;
 
-const TOOLBAR_KEYS = [
-  { id: 'tab', label: 'Tab', value: '\t' },
-  { id: 'esc', label: 'Esc', value: '\x1b' },
-  { id: 'ctrl', label: 'Ctrl', value: null },
-  { id: 'up', label: '↑', value: '\x1b[A' },
-  { id: 'down', label: '↓', value: '\x1b[B' },
-  { id: 'left', label: '←', value: '\x1b[D' },
-  { id: 'right', label: '→', value: '\x1b[C' },
-  { id: 'pipe', label: '|', value: '|' },
-  { id: 'slash', label: '/', value: '/' },
-];
-
-function ctrlChar(key) {
-  const upper = key.toUpperCase();
-  const code = upper.charCodeAt(0);
-  if (code >= 65 && code <= 90) {
-    return String.fromCharCode(code - 64);
-  }
-  if (key === '[') return '\x1b';
-  if (key === '\\') return '\x1c';
-  if (key === ']') return '\x1d';
-  if (key === '^') return '\x1e';
-  if (key === '_') return '\x1f';
-  return null;
-}
+const MONO_FONT = Platform.select({
+  ios: 'Courier New',
+  android: 'monospace',
+  default: 'monospace',
+});
 
 function parseSshCommand(line) {
   const trimmed = line.trim();
   if (!trimmed.toLowerCase().startsWith('ssh ')) {
-    return null;
+    return { type: 'not_ssh' };
   }
 
   const tokens = trimmed.split(/\s+/).slice(1);
@@ -67,8 +46,12 @@ function parseSshCommand(line) {
     parts.push(tokens[i]);
   }
 
-  if (parts.length !== 1 || !parts[0].includes('@')) {
-    return null;
+  if (parts.length !== 1) {
+    return { type: 'invalid' };
+  }
+
+  if (!parts[0].includes('@')) {
+    return { type: 'missing_username' };
   }
 
   const at = parts[0].indexOf('@');
@@ -76,10 +59,10 @@ function parseSshCommand(line) {
   const host = parts[0].slice(at + 1);
 
   if (!username || !host) {
-    return null;
+    return { type: 'missing_username' };
   }
 
-  return { username, host, port };
+  return { type: 'ok', username, host, port };
 }
 
 export default function App() {
@@ -87,14 +70,12 @@ export default function App() {
   const inputRef = useRef(null);
   const sshClientRef = useRef(null);
   const historyRef = useRef([]);
-  const historyBrowseRef = useRef(-1);
 
   const [mode, setMode] = useState('local');
   const [output, setOutput] = useState(STARTUP_TEXT);
   const [input, setInput] = useState('');
   const [pending, setPending] = useState(null);
   const [cursorVisible, setCursorVisible] = useState(true);
-  const [ctrlArmed, setCtrlArmed] = useState(false);
 
   useEffect(() => {
     const timer = setInterval(() => {
@@ -129,33 +110,6 @@ export default function App() {
       next.shift();
     }
     historyRef.current = next;
-    historyBrowseRef.current = next.length;
-  }, []);
-
-  const recallHistory = useCallback((direction) => {
-    const history = historyRef.current;
-    if (history.length === 0) return;
-
-    if (direction === 'up') {
-      if (historyBrowseRef.current <= 0) {
-        historyBrowseRef.current = 0;
-      } else {
-        historyBrowseRef.current -= 1;
-      }
-    } else if (historyBrowseRef.current >= history.length - 1) {
-      historyBrowseRef.current = history.length;
-      setInput('');
-      return;
-    } else {
-      historyBrowseRef.current += 1;
-    }
-
-    if (historyBrowseRef.current >= history.length) {
-      setInput('');
-      return;
-    }
-
-    setInput(history[historyBrowseRef.current]);
   }, []);
 
   const disconnect = useCallback(() => {
@@ -176,7 +130,6 @@ export default function App() {
     setMode('local');
     setPending(null);
     setInput('');
-    historyBrowseRef.current = historyRef.current.length;
   }, []);
 
   const connectSSH = useCallback(
@@ -197,7 +150,6 @@ export default function App() {
       setMode('ssh');
       setPending(null);
       setInput('');
-      historyBrowseRef.current = historyRef.current.length;
     },
     [appendOutput],
   );
@@ -220,7 +172,7 @@ export default function App() {
         await connectSSH(target, password);
       } catch (err) {
         const message = err?.message || String(err);
-        appendOutput(`\nError: ${message}\n\n`);
+        appendOutput(`\nError: ${message}\n\n${PROMPT}`);
         sshClientRef.current = null;
         setMode('local');
         setPending(null);
@@ -237,6 +189,7 @@ export default function App() {
         setTimeout(() => {
           appendOutput('\n');
           disconnect();
+          appendOutput(PROMPT);
         }, 80);
         return;
       }
@@ -246,28 +199,42 @@ export default function App() {
     }
 
     const line = input;
-    appendOutput(`${PROMPT}${line}\n`);
+    appendOutput(`${line}\n`);
     pushHistory(line);
     setInput('');
-    historyBrowseRef.current = historyRef.current.length;
 
     const trimmed = line.trim();
     if (!trimmed) {
+      appendOutput(PROMPT);
       return;
     }
 
-    const sshTarget = parseSshCommand(line);
-    if (sshTarget) {
-      setPending(sshTarget);
+    const parsed = parseSshCommand(line);
+    if (parsed.type === 'ok') {
+      setPending({
+        username: parsed.username,
+        host: parsed.host,
+        port: parsed.port,
+      });
       setMode('password');
-      appendOutput(`${sshTarget.username}@${sshTarget.host}'s password: `);
+      appendOutput(`${parsed.username}@${parsed.host}'s password: `);
       return;
     }
 
-    appendOutput(
-      `forge-lite: command not found: ${trimmed.split(/\s+/)[0]}\n` +
-        "Type 'ssh user@host' to connect.\n\n",
-    );
+    if (parsed.type === 'missing_username') {
+      appendOutput('ssh: missing username. Use: ssh user@host\n\n');
+      appendOutput(PROMPT);
+      return;
+    }
+
+    if (parsed.type === 'invalid' || trimmed.toLowerCase().startsWith('ssh')) {
+      appendOutput('ssh: invalid syntax. Use: ssh user@host\n\n');
+      appendOutput(PROMPT);
+      return;
+    }
+
+    appendOutput(`${trimmed.split(/\s+/)[0]}: command not found\n\n`);
+    appendOutput(PROMPT);
   }, [
     mode,
     input,
@@ -278,65 +245,6 @@ export default function App() {
     disconnect,
     writeToShell,
   ]);
-
-  const handleToolbarPress = useCallback(
-    (key) => {
-      if (key.id === 'ctrl') {
-        setCtrlArmed((armed) => !armed);
-        return;
-      }
-
-      if (key.id === 'up' && mode === 'local') {
-        recallHistory('up');
-        setCtrlArmed(false);
-        inputRef.current?.focus();
-        return;
-      }
-
-      if (key.id === 'down' && mode === 'local') {
-        recallHistory('down');
-        setCtrlArmed(false);
-        inputRef.current?.focus();
-        return;
-      }
-
-      if (mode === 'ssh' && key.value) {
-        writeToShell(key.value);
-        setCtrlArmed(false);
-        inputRef.current?.focus();
-        return;
-      }
-
-      if (mode === 'local' && key.value && key.id !== 'up' && key.id !== 'down') {
-        setInput((prev) => prev + key.value);
-        setCtrlArmed(false);
-        inputRef.current?.focus();
-      }
-    },
-    [mode, recallHistory, writeToShell],
-  );
-
-  const handleInputChange = useCallback(
-    (text) => {
-      if (mode === 'ssh' && ctrlArmed && text.length > input.length) {
-        const added = text.slice(input.length);
-        const lastChar = added[added.length - 1];
-        const control = ctrlChar(lastChar);
-        if (control) {
-          writeToShell(control);
-          setCtrlArmed(false);
-          return;
-        }
-      }
-      setInput(text);
-      if (mode === 'local') {
-        historyBrowseRef.current = historyRef.current.length;
-      }
-    },
-    [mode, input, ctrlArmed, writeToShell],
-  );
-
-  const linePrompt = mode === 'local' ? PROMPT : '';
 
   return (
     <KeyboardAvoidingView
@@ -352,32 +260,16 @@ export default function App() {
       >
         <Text style={styles.terminalText} selectable>
           {output}
-          {linePrompt}
           {mode === 'password' ? '' : input}
           <Text style={{ opacity: cursorVisible ? 1 : 0 }}>▌</Text>
         </Text>
       </ScrollView>
 
-      <View style={styles.toolbar}>
-        {TOOLBAR_KEYS.map((key) => (
-          <Pressable
-            key={key.id}
-            style={[
-              styles.toolbarKey,
-              key.id === 'ctrl' && ctrlArmed && styles.toolbarKeyActive,
-            ]}
-            onPress={() => handleToolbarPress(key)}
-          >
-            <Text style={styles.toolbarKeyText}>{key.label}</Text>
-          </Pressable>
-        ))}
-      </View>
-
       <TextInput
         ref={inputRef}
         style={styles.hiddenInput}
         value={input}
-        onChangeText={handleInputChange}
+        onChangeText={setInput}
         onSubmitEditing={submitCommand}
         autoCapitalize="none"
         autoCorrect={false}
@@ -406,46 +298,16 @@ const styles = StyleSheet.create({
   },
   terminalText: {
     color: FG,
-    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
+    fontFamily: MONO_FONT,
     fontSize: 14,
     lineHeight: 20,
-  },
-  toolbar: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    borderTopWidth: 1,
-    borderTopColor: '#333333',
-    backgroundColor: '#0a0a0a',
-    paddingHorizontal: 4,
-    paddingVertical: 6,
-  },
-  toolbarKey: {
-    minWidth: 44,
-    paddingHorizontal: 10,
-    paddingVertical: 10,
-    margin: 2,
-    borderWidth: 1,
-    borderColor: '#333333',
-    borderRadius: 4,
-    alignItems: 'center',
-  },
-  toolbarKeyActive: {
-    backgroundColor: '#333333',
-  },
-  toolbarKeyText: {
-    color: FG,
-    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
-    fontSize: 13,
-    fontWeight: '600',
   },
   hiddenInput: {
     height: 44,
     paddingHorizontal: 12,
     color: FG,
-    backgroundColor: '#0a0a0a',
-    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
+    backgroundColor: BG,
+    fontFamily: MONO_FONT,
     fontSize: 14,
-    borderTopWidth: 1,
-    borderTopColor: '#333333',
   },
 });
