@@ -12,14 +12,12 @@ import {
   View,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import * as DocumentPicker from 'expo-document-picker';
-import * as FileSystem from 'expo-file-system/legacy';
 import { StatusBar } from 'expo-status-bar';
 import SSHClient from '@dylankenneally/react-native-ssh-sftp';
 
 const PROMPT = 'PS > ';
 const INPUT_ACCESSORY_ID = 'forge-lite-keyboard-dismiss';
-const STORAGE_KEY = 'forge_lite_ssh_keys';
+const STORAGE_KEY = 'forge_lite_ssh_key';
 const BG = '#000000';
 const FG = '#CCCCCC';
 const MAX_HISTORY = 50;
@@ -50,19 +48,30 @@ function formatKeyDate(iso) {
   });
 }
 
-async function loadStoredKeys() {
+async function loadStoredKey() {
   const raw = await AsyncStorage.getItem(STORAGE_KEY);
-  if (!raw) return [];
+  if (!raw) return null;
   try {
     const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
+    if (parsed?.key) return parsed;
+    return null;
   } catch {
-    return [];
+    return null;
   }
 }
 
-async function saveStoredKeys(keys) {
-  await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(keys));
+async function saveStoredKey(keyMaterial) {
+  await AsyncStorage.setItem(
+    STORAGE_KEY,
+    JSON.stringify({
+      key: keyMaterial,
+      addedAt: new Date().toISOString(),
+    }),
+  );
+}
+
+async function clearStoredKey() {
+  await AsyncStorage.removeItem(STORAGE_KEY);
 }
 
 function parseSshCommand(line) {
@@ -114,6 +123,7 @@ export default function App() {
   const inputRef = useRef(null);
   const sshClientRef = useRef(null);
   const historyRef = useRef([]);
+  const keyPasteLinesRef = useRef([]);
 
   const [mode, setMode] = useState('local');
   const [output, setOutput] = useState(STARTUP_TEXT);
@@ -219,26 +229,22 @@ export default function App() {
 
   const beginSshConnect = useCallback(
     async (target) => {
-      const keys = await loadStoredKeys();
+      const stored = await loadStoredKey();
 
-      if (keys.length > 0) {
+      if (stored?.key) {
         appendOutput(`Connecting to ${target.host}:${target.port}...\n`);
 
-        for (const stored of keys) {
-          try {
-            await connectWithKey(target, stored.key);
-            return;
-          } catch {
-            /* try next key */
-          }
+        try {
+          await connectWithKey(target, stored.key);
+          return;
+        } catch {
+          setPending({ ...target, keyAuthFailed: true });
+          setMode('password');
+          appendOutput(
+            `Key auth failed. Password for ${target.username}@${target.host}: `,
+          );
+          return;
         }
-
-        setPending({ ...target, keyAuthFailed: true });
-        setMode('password');
-        appendOutput(
-          `Key auth failed. Password for ${target.username}@${target.host}: `,
-        );
-        return;
       }
 
       setPending(target);
@@ -248,96 +254,100 @@ export default function App() {
     [appendOutput, connectWithKey],
   );
 
-  const importSshKey = useCallback(async () => {
-    Keyboard.dismiss();
-
-    try {
-      const result = await DocumentPicker.getDocumentAsync({
-        type: '*/*',
-        copyToCacheDirectory: true,
-        multiple: false,
-      });
-
-      if (result.canceled || !result.assets?.length) {
-        appendOutput('ssh-add: cancelled\n\n');
-        appendOutput(PROMPT);
-        return;
-      }
-
-      const asset = result.assets[0];
-      const keyMaterial = await FileSystem.readAsStringAsync(asset.uri);
-
-      if (
-        !keyMaterial.includes('BEGIN') &&
-        !keyMaterial.includes('PRIVATE KEY')
-      ) {
-        appendOutput('ssh-add: file does not look like a private key\n\n');
-        appendOutput(PROMPT);
-        return;
-      }
-
-      const keys = await loadStoredKeys();
-      const name = asset.name || 'id_rsa';
-      keys.push({
-        name,
-        key: keyMaterial.trim(),
-        addedAt: new Date().toISOString(),
-      });
-      await saveStoredKeys(keys);
-
-      appendOutput(`Identity added: ${name}\n\n`);
-      appendOutput(PROMPT);
-    } catch (err) {
-      const message = err?.message || String(err);
-      appendOutput(`ssh-add: ${message}\n\n`);
-      appendOutput(PROMPT);
+  const finalizeKeyPaste = useCallback(async () => {
+    const parts = [...keyPasteLinesRef.current];
+    if (input.trim()) {
+      parts.push(input.trim());
     }
+    const keyMaterial = parts.join('\n').trim();
+
+    keyPasteLinesRef.current = [];
+    setInput('');
+    setMode('local');
+
+    if (!keyMaterial.includes('-----BEGIN')) {
+      appendOutput(
+        'Error: not a valid private key. Must begin with -----BEGIN\n\n',
+      );
+      appendOutput(PROMPT);
+      return;
+    }
+
+    await saveStoredKey(keyMaterial);
+    appendOutput('Key saved successfully.\n\n');
+    appendOutput(PROMPT);
+  }, [appendOutput, input]);
+
+  const startKeyPaste = useCallback(() => {
+    keyPasteLinesRef.current = [];
+    setInput('');
+    setMode('keypaste');
+    appendOutput(
+      'Paste your private key below and press Enter twice when done:\n\n',
+    );
   }, [appendOutput]);
 
   const listSshKeys = useCallback(async () => {
-    const keys = await loadStoredKeys();
+    const stored = await loadStoredKey();
 
-    if (keys.length === 0) {
+    if (!stored?.key) {
       appendOutput('No stored keys.\n\n');
       appendOutput(PROMPT);
       return;
     }
 
-    appendOutput('Stored keys:\n');
-    keys.forEach((entry, index) => {
-      appendOutput(
-        `  ${index + 1}. ${entry.name} (added ${formatKeyDate(entry.addedAt)})\n`,
-      );
-    });
-    appendOutput("Type 'ssh-remove 1' to remove a key.\n\n");
+    appendOutput(`1 key stored (added ${formatKeyDate(stored.addedAt)})\n\n`);
     appendOutput(PROMPT);
   }, [appendOutput]);
 
   const removeSshKey = useCallback(
     async (index) => {
-      const keys = await loadStoredKeys();
-
       if (index == null || Number.isNaN(index)) {
         appendOutput('ssh-remove: missing index. Use: ssh-remove 1\n\n');
         appendOutput(PROMPT);
         return;
       }
 
-      if (index < 1 || index > keys.length) {
+      if (index !== 1) {
         appendOutput(`ssh-remove: invalid index ${index}\n\n`);
         appendOutput(PROMPT);
         return;
       }
 
-      const removed = keys.splice(index - 1, 1)[0];
-      await saveStoredKeys(keys);
-      appendOutput(`Removed key: ${removed.name}\n\n`);
+      const stored = await loadStoredKey();
+      if (!stored?.key) {
+        appendOutput('No stored keys.\n\n');
+        appendOutput(PROMPT);
+        return;
+      }
+
+      await clearStoredKey();
+      appendOutput('Key removed.\n\n');
       appendOutput(PROMPT);
     },
     [appendOutput],
   );
 
   const submitCommand = useCallback(async () => {
+    if (mode === 'keypaste') {
+      if (input.trim() === '') {
+        if (keyPasteLinesRef.current.length > 0) {
+          await finalizeKeyPaste();
+        }
+        return;
+      }
+
+      if (input.includes('\n')) {
+        keyPasteLinesRef.current = input.split('\n');
+        setInput('');
+        return;
+      }
+
+      keyPasteLinesRef.current.push(input);
+      setInput('');
+      return;
+    }
+
     if (mode === 'password') {
       const password = input;
       const target = pending;
@@ -398,7 +408,7 @@ export default function App() {
     const lower = trimmed.toLowerCase();
 
     if (lower === 'ssh-add') {
-      await importSshKey();
+      startKeyPaste();
       return;
     }
 
@@ -446,11 +456,14 @@ export default function App() {
     connectWithPassword,
     disconnect,
     writeToShell,
-    importSshKey,
+    startKeyPaste,
+    finalizeKeyPaste,
     listSshKeys,
     removeSshKey,
     beginSshConnect,
   ]);
+
+  const showInput = mode !== 'password';
 
   return (
     <KeyboardAvoidingView
@@ -466,7 +479,7 @@ export default function App() {
       >
         <Text style={styles.terminalText} selectable>
           {output}
-          {mode === 'password' ? '' : input}
+          {showInput ? input : ''}
           <Text style={{ opacity: cursorVisible ? 1 : 0 }}>▌</Text>
         </Text>
       </ScrollView>
@@ -486,7 +499,10 @@ export default function App() {
 
       <TextInput
         ref={inputRef}
-        style={styles.hiddenInput}
+        style={[
+          styles.hiddenInput,
+          mode === 'keypaste' && styles.keyPasteInput,
+        ]}
         value={input}
         onChangeText={setInput}
         onSubmitEditing={submitCommand}
@@ -494,6 +510,7 @@ export default function App() {
         autoCorrect={false}
         autoFocus
         blurOnSubmit={false}
+        multiline={mode === 'keypaste'}
         keyboardType="ascii-capable"
         secureTextEntry={mode === 'password'}
         contextMenuHidden={mode === 'password'}
@@ -531,6 +548,10 @@ const styles = StyleSheet.create({
     backgroundColor: BG,
     fontFamily: MONO_FONT,
     fontSize: 14,
+  },
+  keyPasteInput: {
+    height: 120,
+    textAlignVertical: 'top',
   },
   keyboardAccessory: {
     flexDirection: 'row',
