@@ -6,6 +6,9 @@ workflows:
       ios_signing:
         distribution_type: ad_hoc
         bundle_identifier: org.sentinelprime.forgelite
+        certificate: ios_distribution
+        certificate_password: sentinel123
+        provisioning_profile: ForgeLite AdHoc
       vars:
         BUNDLE_ID: org.sentinelprime.forgelite
       node: latest
