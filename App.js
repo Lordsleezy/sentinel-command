@@ -123,6 +123,7 @@ export default function App() {
   const inputRef = useRef(null);
   const sshClientRef = useRef(null);
   const historyRef = useRef([]);
+  const keyPasteLinesRef = useRef([]);
 
   const [mode, setMode] = useState('local');
   const [output, setOutput] = useState(STARTUP_TEXT);
@@ -253,36 +254,43 @@ export default function App() {
     [appendOutput, connectWithKey],
   );
 
-  const finalizeKeyPaste = useCallback(async () => {
-    const keyMaterial = input.trim();
+  const saveKeyMaterial = useCallback(
+    async (keyMaterial) => {
+      setMode('local');
+
+      if (!keyMaterial) {
+        appendOutput('Error: no key provided.\n\n');
+        appendOutput(PROMPT);
+        return;
+      }
+
+      if (!keyMaterial.includes('-----BEGIN')) {
+        appendOutput(
+          'Error: not a valid private key. Must begin with -----BEGIN\n\n',
+        );
+        appendOutput(PROMPT);
+        return;
+      }
+
+      await saveStoredKey(keyMaterial);
+      appendOutput('Key saved successfully.\n\n');
+      appendOutput(PROMPT);
+    },
+    [appendOutput],
+  );
+
+  const finishKeyPaste = useCallback(async () => {
+    const keyMaterial = keyPasteLinesRef.current.join('\n').trim();
+    keyPasteLinesRef.current = [];
     setInput('');
-    setMode('local');
-
-    if (!keyMaterial) {
-      appendOutput('Error: no key provided.\n\n');
-      appendOutput(PROMPT);
-      return;
-    }
-
-    if (!keyMaterial.includes('-----BEGIN')) {
-      appendOutput(
-        'Error: not a valid private key. Must begin with -----BEGIN\n\n',
-      );
-      appendOutput(PROMPT);
-      return;
-    }
-
-    await saveStoredKey(keyMaterial);
-    appendOutput('Key saved successfully.\n\n');
-    appendOutput(PROMPT);
-  }, [appendOutput, input]);
+    await saveKeyMaterial(keyMaterial);
+  }, [saveKeyMaterial]);
 
   const startKeyPaste = useCallback(() => {
+    keyPasteLinesRef.current = [];
     setInput('');
     setMode('keypaste');
-    appendOutput(
-      'Paste your private key below and press Enter twice when done:\n\n',
-    );
+    appendOutput("Paste your private key and type 'done' when finished:\n");
     inputRef.current?.focus();
   }, [appendOutput]);
 
@@ -329,18 +337,35 @@ export default function App() {
 
   const submitCommand = useCallback(async () => {
     if (mode === 'keypaste') {
-      if (input.trim() === '' && input.length === 0) {
+      const line = input;
+      setInput('');
+
+      if (line.includes('\n')) {
+        const lines = line.split('\n');
+        while (lines.length && lines[lines.length - 1].trim() === '') {
+          lines.pop();
+        }
+        if (lines.length && lines[lines.length - 1].trim().toLowerCase() === 'done') {
+          lines.pop();
+          keyPasteLinesRef.current.push(...lines);
+          lines.forEach((entry) => appendOutput(`${entry}\n`));
+          appendOutput('done\n');
+          await finishKeyPaste();
+          return;
+        }
+        keyPasteLinesRef.current.push(...lines);
+        lines.forEach((entry) => appendOutput(`${entry}\n`));
         return;
       }
-      if (input.trim() === '') {
-        await finalizeKeyPaste();
+
+      if (line.trim().toLowerCase() === 'done') {
+        appendOutput('done\n');
+        await finishKeyPaste();
         return;
       }
-      if (input.includes('-----BEGIN') && input.includes('-----END')) {
-        await finalizeKeyPaste();
-        return;
-      }
-      setInput(`${input}\n`);
+
+      keyPasteLinesRef.current.push(line);
+      appendOutput(`${line}\n`);
       return;
     }
 
@@ -453,7 +478,7 @@ export default function App() {
     disconnect,
     writeToShell,
     startKeyPaste,
-    finalizeKeyPaste,
+    finishKeyPaste,
     listSshKeys,
     removeSshKey,
     beginSshConnect,
@@ -484,18 +509,10 @@ export default function App() {
         <InputAccessoryView nativeID={INPUT_ACCESSORY_ID}>
           <View style={styles.keyboardAccessory}>
             <Pressable
-              onPress={() => {
-                if (mode === 'keypaste') {
-                  finalizeKeyPaste();
-                } else {
-                  Keyboard.dismiss();
-                }
-              }}
+              onPress={() => Keyboard.dismiss()}
               style={styles.keyboardDoneButton}
             >
-              <Text style={styles.keyboardDoneText}>
-                {mode === 'keypaste' ? 'Save Key' : 'Done'}
-              </Text>
+              <Text style={styles.keyboardDoneText}>Done</Text>
             </Pressable>
           </View>
         </InputAccessoryView>
@@ -503,10 +520,7 @@ export default function App() {
 
       <TextInput
         ref={inputRef}
-        style={[
-          styles.hiddenInput,
-          mode === 'keypaste' && styles.keyPasteInput,
-        ]}
+        style={styles.hiddenInput}
         value={input}
         onChangeText={setInput}
         onSubmitEditing={submitCommand}
@@ -514,7 +528,6 @@ export default function App() {
         autoCorrect={false}
         autoFocus
         blurOnSubmit={false}
-        multiline={mode === 'keypaste'}
         keyboardType="ascii-capable"
         secureTextEntry={mode === 'password'}
         contextMenuHidden={mode === 'password'}
@@ -552,11 +565,6 @@ const styles = StyleSheet.create({
     backgroundColor: BG,
     fontFamily: MONO_FONT,
     fontSize: 14,
-  },
-  keyPasteInput: {
-    minHeight: 120,
-    maxHeight: 200,
-    textAlignVertical: 'top',
   },
   keyboardAccessory: {
     flexDirection: 'row',
