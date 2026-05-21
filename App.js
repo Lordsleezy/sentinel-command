@@ -112,6 +112,18 @@ function parseSshCommand(line) {
   return { type: 'ok', username, host, port };
 }
 
+function normalizeKeyContent(raw) {
+  let keyContent = raw.trim();
+  if (!keyContent) return '';
+
+  if (!keyContent.includes('-----BEGIN')) {
+    keyContent =
+      `-----BEGIN OPENSSH PRIVATE KEY-----\n${keyContent}\n-----END OPENSSH PRIVATE KEY-----`;
+  }
+
+  return keyContent;
+}
+
 function parseRemoveIndex(line) {
   const match = line.trim().match(/^ssh-remove(?:\s+(\d+))?$/i);
   if (!match) return null;
@@ -255,19 +267,13 @@ export default function App() {
   );
 
   const saveKeyMaterial = useCallback(
-    async (keyMaterial) => {
+    async (rawKeyMaterial) => {
       setMode('local');
+
+      const keyMaterial = normalizeKeyContent(rawKeyMaterial);
 
       if (!keyMaterial) {
         appendOutput('Error: no key provided.\n\n');
-        appendOutput(PROMPT);
-        return;
-      }
-
-      if (!keyMaterial.includes('-----BEGIN')) {
-        appendOutput(
-          'Error: not a valid private key. Must begin with -----BEGIN\n\n',
-        );
         appendOutput(PROMPT);
         return;
       }
@@ -290,7 +296,10 @@ export default function App() {
     keyPasteLinesRef.current = [];
     setInput('');
     setMode('keypaste');
-    appendOutput("Paste your private key and type 'done' when finished:\n");
+    appendOutput(
+      "Paste your private key below and type 'done' when finished.\n" +
+        'You can paste just the key content or the full key including headers:\n',
+    );
     inputRef.current?.focus();
   }, [appendOutput]);
 
