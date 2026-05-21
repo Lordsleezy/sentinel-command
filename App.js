@@ -30,7 +30,8 @@ const STARTUP_TEXT =
   '  ssh user@host        Connect to a remote machine\n' +
   '  ssh-add              Import an SSH private key\n' +
   '  ssh-keys             List stored keys\n' +
-  "  ssh-remove [n]       Remove a stored key\n\n" +
+  "  ssh-remove [n]       Remove a stored key\n" +
+  '  ssh-debug            Show key auth diagnostics\n\n' +
   PROMPT;
 
 const MONO_FONT = Platform.select({
@@ -60,11 +61,12 @@ async function loadStoredKey() {
   }
 }
 
-async function saveStoredKey(keyMaterial) {
+async function saveStoredKey(keyMaterial, publicKey = null) {
   await AsyncStorage.setItem(
     STORAGE_KEY,
     JSON.stringify({
       key: keyMaterial,
+      publicKey,
       addedAt: new Date().toISOString(),
     }),
   );
@@ -116,16 +118,217 @@ function wrapKey(raw) {
   let key = raw.trim();
   if (!key) return '';
 
-  key = key
-    .replace(/-----BEGIN [^-]+-----/g, '')
-    .replace(/-----END [^-]+-----/g, '')
-    .trim();
-
-  if (!key) return '';
+  if (/-----BEGIN [^-]+-----/.test(key)) {
+    return key;
+  }
 
   return (
     `-----BEGIN OPENSSH PRIVATE KEY-----\n${key}\n-----END OPENSSH PRIVATE KEY-----`
   );
+}
+
+function decodeBase64(str) {
+  const cleaned = str.replace(/\s/g, '');
+  if (typeof globalThis.atob === 'function') {
+    const binary = globalThis.atob(cleaned);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes;
+  }
+  throw new Error('Base64 decode unavailable in this runtime');
+}
+
+function readSshString(bytes, offset) {
+  const view = new DataView(bytes.buffer, bytes.byteOffset + offset, 4);
+  const length = view.getUint32(0);
+  const start = offset + 4;
+  const value = bytes.slice(start, start + length);
+  return { value, next: start + length };
+}
+
+function encodeSshPublicLine(keyType, keyBytes) {
+  const typeBytes = new TextEncoder().encode(keyType);
+  const wire = new Uint8Array(4 + typeBytes.length + 4 + keyBytes.length);
+  const view = new DataView(wire.buffer);
+  let offset = 0;
+  view.setUint32(offset, typeBytes.length);
+  offset += 4;
+  wire.set(typeBytes, offset);
+  offset += typeBytes.length;
+  view.setUint32(offset, keyBytes.length);
+  offset += 4;
+  wire.set(keyBytes, offset);
+
+  let binary = '';
+  for (let i = 0; i < wire.length; i += 1) {
+    binary += String.fromCharCode(wire[i]);
+  }
+  const encoded = globalThis.btoa(binary);
+  return `${keyType} ${encoded}`;
+}
+
+function extractPublicKeyFromOpenSSH(privateKey) {
+  const body = privateKey
+    .replace(/-----BEGIN [^-]+-----/g, '')
+    .replace(/-----END [^-]+-----/g, '')
+    .replace(/\s/g, '');
+  const data = decodeBase64(body);
+  const magic = new TextDecoder().decode(data.slice(0, 15));
+  if (!magic.startsWith('openssh-key-v1')) {
+    throw new Error('Not an OpenSSH private key (openssh-key-v1)');
+  }
+
+  let offset = 15;
+  let part = readSshString(data, offset);
+  offset = part.next;
+  part = readSshString(data, offset);
+  offset = part.next;
+  part = readSshString(data, offset);
+  offset = part.next;
+
+  const view = new DataView(data.buffer, data.byteOffset + offset, 4);
+  const keyCount = view.getUint32(0);
+  offset += 4;
+  if (keyCount < 1) {
+    throw new Error('OpenSSH key blob contains no public keys');
+  }
+
+  part = readSshString(data, offset);
+  offset = part.next;
+  const publicSection = part.value;
+
+  let sectionOffset = 0;
+  part = readSshString(publicSection, sectionOffset);
+  const keyType = new TextDecoder().decode(part.value);
+  sectionOffset = part.next;
+  part = readSshString(publicSection, sectionOffset);
+  const publicKeyBytes = part.value;
+
+  return encodeSshPublicLine(keyType, publicKeyBytes);
+}
+
+function detectKeyType(privateKey) {
+  if (privateKey.includes('OPENSSH PRIVATE KEY')) return 'openssh';
+  if (privateKey.includes('RSA PRIVATE KEY')) return 'rsa-pem';
+  if (privateKey.includes('EC PRIVATE KEY')) return 'ecdsa-pem';
+  if (privateKey.includes('DSA PRIVATE KEY')) return 'dsa-pem';
+  if (privateKey.includes('ENCRYPTED PRIVATE KEY')) return 'pkcs8-encrypted';
+  return 'unknown';
+}
+
+function extractPublicKeyFromPrivateKey(privateKey) {
+  const keyType = detectKeyType(privateKey);
+  if (keyType === 'openssh') {
+    return extractPublicKeyFromOpenSSH(privateKey);
+  }
+  return null;
+}
+
+function formatAuthError(error) {
+  if (error == null) return 'Unknown error';
+  if (typeof error === 'string') return error;
+  if (typeof error?.message === 'string' && error.message) return error.message;
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return String(error);
+  }
+}
+
+function classifyAuthFailure(message) {
+  const lower = message.toLowerCase();
+  if (
+    lower.includes('authentication') ||
+    lower.includes('auth failed') ||
+    lower.includes('not authorized') ||
+    lower.includes('permission denied')
+  ) {
+    return 'server-rejected-or-auth-failed';
+  }
+  if (
+    lower.includes('parse') ||
+    lower.includes('invalid key') ||
+    lower.includes('not an openssh') ||
+    lower.includes('base64') ||
+    lower.includes('decode')
+  ) {
+    return 'client-parse-failure';
+  }
+  if (lower.includes('connect') || lower.includes('timeout') || lower.includes('network')) {
+    return 'connection-failure';
+  }
+  return 'unknown';
+}
+
+function diagnoseStoredKey(privateKey, publicKey) {
+  const lines = privateKey.split('\n');
+  return {
+    firstLine: lines[0] || '(empty)',
+    lastLine: lines[lines.length - 1] || '(empty)',
+    totalLength: privateKey.length,
+    lineCount: lines.length,
+    hasLiteralBackslashN: privateKey.includes('\\n'),
+    hasCrlf: privateKey.includes('\r'),
+    keyType: detectKeyType(privateKey),
+    publicKeyExtracted: Boolean(publicKey),
+    publicKeyPreview: publicKey
+      ? `${publicKey.split(/\s+/)[0]} ${(publicKey.split(/\s+/)[1] || '').slice(0, 24)}...`
+      : '(none)',
+  };
+}
+
+function connectWithKeyPair(host, port, username, keyPair) {
+  return new Promise((resolve, reject) => {
+    const client = new SSHClient(host, port, username, keyPair, (error) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve(client);
+    });
+  });
+}
+
+async function prepareKeyAuth(stored) {
+  const privateKey = wrapKey(stored.key);
+  let publicKey = stored.publicKey || null;
+  let publicKeySource = stored.publicKey ? 'stored' : 'none';
+
+  if (!publicKey) {
+    try {
+      publicKey = extractPublicKeyFromPrivateKey(privateKey);
+      if (publicKey) {
+        publicKeySource = 'extracted';
+      }
+    } catch (error) {
+      return {
+        privateKey,
+        publicKey: null,
+        publicKeySource: 'extraction-failed',
+        keyType: detectKeyType(privateKey),
+        extractionError: formatAuthError(error),
+        diagnostics: diagnoseStoredKey(privateKey, null),
+      };
+    }
+  }
+
+  let nativeKeyDetails = null;
+  try {
+    nativeKeyDetails = await SSHClient.getKeyDetails(privateKey);
+  } catch (error) {
+    nativeKeyDetails = { error: formatAuthError(error) };
+  }
+
+  return {
+    privateKey,
+    publicKey,
+    publicKeySource,
+    keyType: detectKeyType(privateKey),
+    nativeKeyDetails,
+    diagnostics: diagnoseStoredKey(privateKey, publicKey),
+  };
 }
 
 function parseRemoveIndex(line) {
@@ -140,6 +343,8 @@ export default function App() {
   const sshClientRef = useRef(null);
   const historyRef = useRef([]);
   const keyPasteLinesRef = useRef([]);
+  const lastAuthDebugRef = useRef(null);
+  const lastSshTargetRef = useRef(null);
 
   const [mode, setMode] = useState('local');
   const [output, setOutput] = useState(STARTUP_TEXT);
@@ -230,34 +435,112 @@ export default function App() {
   );
 
   const connectWithKey = useCallback(
-    async (target, privateKey, passphrase = '') => {
-      const client = await SSHClient.connectWithKey(
+    async (target, authPrep, passphrase = '') => {
+      const keyPair = {
+        privateKey: authPrep.privateKey,
+        passphrase,
+      };
+
+      if (authPrep.publicKey) {
+        keyPair.publicKey = authPrep.publicKey;
+      }
+
+      console.log('[ForgeLite SSH] connectWithKey', {
+        host: target.host,
+        port: target.port,
+        username: target.username,
+        authMethod: 'publickey',
+        keyType: authPrep.keyType,
+        publicKeySource: authPrep.publicKeySource,
+        privateKeyFirstLine: authPrep.diagnostics.firstLine,
+        privateKeyLength: authPrep.diagnostics.totalLength,
+        publicKeyPreview: authPrep.diagnostics.publicKeyPreview,
+      });
+
+      const client = await connectWithKeyPair(
         target.host,
         target.port,
         target.username,
-        wrapKey(privateKey),
-        passphrase,
+        keyPair,
       );
       await establishShell(client);
     },
     [establishShell],
   );
 
+  const reportKeyAuthFailure = useCallback(
+    (error, target, authPrep) => {
+      const message = formatAuthError(error);
+      const failureClass = classifyAuthFailure(message);
+      const debug = {
+        message,
+        failureClass,
+        authMethod: 'publickey',
+        target: `${target.username}@${target.host}:${target.port}`,
+        keyType: authPrep.keyType,
+        publicKeySource: authPrep.publicKeySource,
+        extractionError: authPrep.extractionError || null,
+        nativeKeyDetails: authPrep.nativeKeyDetails || null,
+        diagnostics: authPrep.diagnostics,
+        rawError: error,
+      };
+
+      lastAuthDebugRef.current = debug;
+      console.error('[ForgeLite SSH] key auth failed', debug);
+
+      appendOutput(`Key auth failed: ${message}\n`);
+      appendOutput(`  failure class: ${failureClass}\n`);
+      appendOutput(`  auth method: publickey\n`);
+      appendOutput(`  key type: ${authPrep.keyType}\n`);
+      appendOutput(`  public key: ${authPrep.publicKeySource}\n`);
+      if (authPrep.extractionError) {
+        appendOutput(`  public key extraction: ${authPrep.extractionError}\n`);
+      }
+      if (authPrep.nativeKeyDetails?.keyType) {
+        appendOutput(
+          `  native parser: ${authPrep.nativeKeyDetails.keyType}` +
+            `${authPrep.nativeKeyDetails.keySize ? ` (${authPrep.nativeKeyDetails.keySize})` : ''}\n`,
+        );
+      } else if (authPrep.nativeKeyDetails?.error) {
+        appendOutput(`  native parser: ${authPrep.nativeKeyDetails.error}\n`);
+      }
+      appendOutput(`  Run ssh-debug for full details.\n`);
+    },
+    [appendOutput],
+  );
+
   const beginSshConnect = useCallback(
     async (target) => {
+      lastSshTargetRef.current = target;
       const stored = await loadStoredKey();
 
       if (stored?.key) {
         appendOutput(`Connecting to ${target.host}:${target.port}...\n`);
 
-        try {
-          await connectWithKey(target, stored.key);
-          return;
-        } catch {
+        const authPrep = await prepareKeyAuth(stored);
+        if (authPrep.extractionError && authPrep.keyType === 'openssh') {
+          reportKeyAuthFailure(
+            new Error(`Public key extraction failed: ${authPrep.extractionError}`),
+            target,
+            authPrep,
+          );
           setPending({ ...target, keyAuthFailed: true });
           setMode('password');
           appendOutput(
-            `Key auth failed. Password for ${target.username}@${target.host}: `,
+            `Password for ${target.username}@${target.host}: `,
+          );
+          return;
+        }
+
+        try {
+          await connectWithKey(target, authPrep);
+          return;
+        } catch (error) {
+          reportKeyAuthFailure(error, target, authPrep);
+          setPending({ ...target, keyAuthFailed: true });
+          setMode('password');
+          appendOutput(
+            `Password for ${target.username}@${target.host}: `,
           );
           return;
         }
@@ -267,7 +550,7 @@ export default function App() {
       setMode('password');
       appendOutput(`${target.username}@${target.host}'s password: `);
     },
-    [appendOutput, connectWithKey],
+    [appendOutput, connectWithKey, reportKeyAuthFailure],
   );
 
   const saveKeyMaterial = useCallback(
@@ -282,8 +565,22 @@ export default function App() {
         return;
       }
 
-      await saveStoredKey(keyMaterial);
-      appendOutput('Key saved successfully.\n\n');
+      let publicKey = null;
+
+      try {
+        publicKey = extractPublicKeyFromPrivateKey(keyMaterial);
+      } catch (error) {
+        appendOutput(
+          `Warning: could not extract public key (${formatAuthError(error)}).\n`,
+        );
+      }
+
+      await saveStoredKey(keyMaterial, publicKey);
+      appendOutput('Key saved successfully.\n');
+      appendOutput(`  type: ${detectKeyType(keyMaterial)}\n`);
+      appendOutput(
+        `  public key: ${publicKey ? 'extracted and stored' : 'not extracted'}\n\n`,
+      );
       appendOutput(PROMPT);
     },
     [appendOutput],
@@ -305,6 +602,66 @@ export default function App() {
         '(Headers and footers are optional)\n',
     );
     inputRef.current?.focus();
+  }, [appendOutput]);
+
+  const runSshDebug = useCallback(async () => {
+    const stored = await loadStoredKey();
+    const target = lastSshTargetRef.current;
+
+    appendOutput('=== ssh-debug ===\n');
+
+    if (!stored?.key) {
+      appendOutput('No stored private key.\n\n');
+      appendOutput(PROMPT);
+      return;
+    }
+
+    const authPrep = await prepareKeyAuth(stored);
+    appendOutput(`stored key first line: ${authPrep.diagnostics.firstLine}\n`);
+    appendOutput(`stored key last line: ${authPrep.diagnostics.lastLine}\n`);
+    appendOutput(`stored key length: ${authPrep.diagnostics.totalLength}\n`);
+    appendOutput(
+      `literal \\n present: ${authPrep.diagnostics.hasLiteralBackslashN ? 'yes' : 'no'}\n`,
+    );
+    appendOutput(`key type detected: ${authPrep.keyType}\n`);
+    appendOutput(`public key source: ${authPrep.publicKeySource}\n`);
+    appendOutput(`public key preview: ${authPrep.diagnostics.publicKeyPreview}\n`);
+
+    if (authPrep.extractionError) {
+      appendOutput(`public key extraction error: ${authPrep.extractionError}\n`);
+    }
+
+    if (authPrep.nativeKeyDetails?.keyType) {
+      appendOutput(
+        `native getKeyDetails: ${authPrep.nativeKeyDetails.keyType}` +
+          `${authPrep.nativeKeyDetails.keySize ? ` (${authPrep.nativeKeyDetails.keySize})` : ''}\n`,
+      );
+    } else if (authPrep.nativeKeyDetails?.error) {
+      appendOutput(`native getKeyDetails: ${authPrep.nativeKeyDetails.error}\n`);
+    }
+
+    if (target) {
+      appendOutput(
+        `last connection target: ${target.username}@${target.host}:${target.port}\n`,
+      );
+    } else {
+      appendOutput('last connection target: (none — run ssh user@host first)\n');
+    }
+
+    appendOutput('auth method: publickey\n');
+
+    if (lastAuthDebugRef.current) {
+      appendOutput(`last auth failure class: ${lastAuthDebugRef.current.failureClass}\n`);
+      appendOutput(`last raw SSH error: ${lastAuthDebugRef.current.message}\n`);
+    } else {
+      appendOutput('last raw SSH error: (none — no failed attempt this session)\n');
+    }
+
+    appendOutput(
+      'library: @dylankenneally/react-native-ssh-sftp (iOS NMSSH/libssh2)\n',
+    );
+    appendOutput('=== end ssh-debug ===\n\n');
+    appendOutput(PROMPT);
   }, [appendOutput]);
 
   const listSshKeys = useCallback(async () => {
@@ -451,6 +808,11 @@ export default function App() {
       return;
     }
 
+    if (lower === 'ssh-debug') {
+      await runSshDebug();
+      return;
+    }
+
     const removeIndex = parseRemoveIndex(trimmed);
     if (removeIndex !== null || lower === 'ssh-remove') {
       await removeSshKey(removeIndex);
@@ -493,6 +855,7 @@ export default function App() {
     startKeyPaste,
     finishKeyPaste,
     listSshKeys,
+    runSshDebug,
     removeSshKey,
     beginSshConnect,
   ]);
