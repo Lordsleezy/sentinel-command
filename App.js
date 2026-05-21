@@ -112,16 +112,20 @@ function parseSshCommand(line) {
   return { type: 'ok', username, host, port };
 }
 
-function normalizeKeyContent(raw) {
-  let keyContent = raw.trim();
-  if (!keyContent) return '';
+function wrapKey(raw) {
+  let key = raw.trim();
+  if (!key) return '';
 
-  if (!keyContent.includes('-----BEGIN')) {
-    keyContent =
-      `-----BEGIN OPENSSH PRIVATE KEY-----\n${keyContent}\n-----END OPENSSH PRIVATE KEY-----`;
-  }
+  key = key
+    .replace(/-----BEGIN [^-]+-----/g, '')
+    .replace(/-----END [^-]+-----/g, '')
+    .trim();
 
-  return keyContent;
+  if (!key) return '';
+
+  return (
+    `-----BEGIN OPENSSH PRIVATE KEY-----\n${key}\n-----END OPENSSH PRIVATE KEY-----`
+  );
 }
 
 function parseRemoveIndex(line) {
@@ -231,7 +235,7 @@ export default function App() {
         target.host,
         target.port,
         target.username,
-        privateKey,
+        wrapKey(privateKey),
         passphrase,
       );
       await establishShell(client);
@@ -270,7 +274,7 @@ export default function App() {
     async (rawKeyMaterial) => {
       setMode('local');
 
-      const keyMaterial = normalizeKeyContent(rawKeyMaterial);
+      const keyMaterial = wrapKey(rawKeyMaterial);
 
       if (!keyMaterial) {
         appendOutput('Error: no key provided.\n\n');
@@ -297,8 +301,8 @@ export default function App() {
     setInput('');
     setMode('keypaste');
     appendOutput(
-      "Paste your private key below and type 'done' when finished.\n" +
-        'You can paste just the key content or the full key including headers:\n',
+      "Paste your private key content and type 'done' when finished.\n" +
+        '(Headers and footers are optional)\n',
     );
     inputRef.current?.focus();
   }, [appendOutput]);
