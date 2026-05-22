@@ -115,17 +115,177 @@ function parseSshCommand(line) {
   return { type: 'ok', username, host, port };
 }
 
-function wrapKey(raw) {
-  let key = raw.trim();
-  if (!key) return '';
+function normalizeNewlines(key) {
+  return key.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim();
+}
 
-  if (/-----BEGIN [^-]+-----/.test(key)) {
+function stripPemHeaders(key, label) {
+  const begin = `-----BEGIN ${label}-----`;
+  const end = `-----END ${label}-----`;
+  return key.replace(begin, '').replace(end, '').trim();
+}
+
+function isRsaAsn1Body(body) {
+  const cleaned = body.replace(/\s/g, '');
+  return cleaned.startsWith('MII') && /^[A-Za-z0-9+/=\s]+$/.test(cleaned);
+}
+
+function isOpensshKeyBody(body) {
+  const cleaned = body.replace(/\s/g, '');
+  if (cleaned.startsWith('b3BlbnNzaC1rZXk')) {
+    return true;
+  }
+
+  try {
+    if (typeof globalThis.atob === 'function') {
+      const decoded = globalThis.atob(cleaned.slice(0, 24));
+      return decoded.startsWith('openssh-key-v1');
+    }
+  } catch {
+    return false;
+  }
+
+  return false;
+}
+
+function repairMangledKey(key) {
+  if (!key.includes('-----BEGIN OPENSSH PRIVATE KEY-----')) {
     return key;
   }
 
-  return (
-    `-----BEGIN OPENSSH PRIVATE KEY-----\n${key}\n-----END OPENSSH PRIVATE KEY-----`
-  );
+  const body = stripPemHeaders(key, 'OPENSSH PRIVATE KEY');
+  if (!isRsaAsn1Body(body)) {
+    return key;
+  }
+
+  console.warn('[ForgeLite wrapKey] repairing mangled key: RSA body inside OpenSSH headers');
+  return `-----BEGIN RSA PRIVATE KEY-----\n${body}\n-----END RSA PRIVATE KEY-----`;
+}
+
+function detectKeyType(privateKey) {
+  if (privateKey.includes('OPENSSH PRIVATE KEY')) return 'openssh';
+  if (privateKey.includes('RSA PRIVATE KEY')) return 'rsa-pem';
+  if (privateKey.includes('EC PRIVATE KEY')) return 'ecdsa-pem';
+  if (privateKey.includes('DSA PRIVATE KEY')) return 'dsa-pem';
+  if (privateKey.includes('ENCRYPTED PRIVATE KEY')) return 'pkcs8-encrypted';
+  if (isRsaAsn1Body(privateKey)) return 'rsa-pem-body';
+  if (isOpensshKeyBody(privateKey)) return 'openssh-body';
+  return 'unknown';
+}
+
+function wrapKey(raw) {
+  let key = normalizeNewlines(raw);
+  if (!key) {
+    console.log('[ForgeLite wrapKey] empty input');
+    return '';
+  }
+
+  key = repairMangledKey(key);
+
+  const inputType = detectKeyType(key);
+  const inputFirstLine = key.split('\n')[0];
+  let wrapped = false;
+
+  console.log('[ForgeLite wrapKey] input', {
+    detectedType: inputType,
+    firstLine: inputFirstLine,
+  });
+
+  if (key.includes('-----BEGIN RSA PRIVATE KEY-----')) {
+    const result = key;
+    console.log('[ForgeLite wrapKey] result', {
+      detectedType: 'rsa-pem',
+      conversion: false,
+      finalFirstLine: result.split('\n')[0],
+    });
+    return result;
+  }
+
+  if (key.includes('-----BEGIN OPENSSH PRIVATE KEY-----')) {
+    const result = key;
+    console.log('[ForgeLite wrapKey] result', {
+      detectedType: 'openssh',
+      conversion: false,
+      finalFirstLine: result.split('\n')[0],
+    });
+    return result;
+  }
+
+  if (key.includes('-----BEGIN EC PRIVATE KEY-----')) {
+    const result = key;
+    console.log('[ForgeLite wrapKey] result', {
+      detectedType: 'ecdsa-pem',
+      conversion: false,
+      finalFirstLine: result.split('\n')[0],
+    });
+    return result;
+  }
+
+  if (key.includes('-----BEGIN DSA PRIVATE KEY-----')) {
+    const result = key;
+    console.log('[ForgeLite wrapKey] result', {
+      detectedType: 'dsa-pem',
+      conversion: false,
+      finalFirstLine: result.split('\n')[0],
+    });
+    return result;
+  }
+
+  if (key.includes('-----BEGIN ENCRYPTED PRIVATE KEY-----')) {
+    const result = key;
+    console.log('[ForgeLite wrapKey] result', {
+      detectedType: 'pkcs8-encrypted',
+      conversion: false,
+      finalFirstLine: result.split('\n')[0],
+    });
+    return result;
+  }
+
+  if (/-----BEGIN [^-]+-----/.test(key)) {
+    const result = key;
+    console.log('[ForgeLite wrapKey] result', {
+      detectedType: inputType,
+      conversion: false,
+      finalFirstLine: result.split('\n')[0],
+    });
+    return result;
+  }
+
+  const body = key.replace(/\s/g, '');
+
+  if (isRsaAsn1Body(body)) {
+    wrapped = true;
+    key = `-----BEGIN RSA PRIVATE KEY-----\n${key}\n-----END RSA PRIVATE KEY-----`;
+    console.log('[ForgeLite wrapKey] result', {
+      detectedType: 'rsa-pem',
+      conversion: true,
+      wrapping: 'rsa-pem-headers-added',
+      finalFirstLine: key.split('\n')[0],
+    });
+    return key;
+  }
+
+  if (isOpensshKeyBody(body)) {
+    wrapped = true;
+    key = `-----BEGIN OPENSSH PRIVATE KEY-----\n${key}\n-----END OPENSSH PRIVATE KEY-----`;
+    console.log('[ForgeLite wrapKey] result', {
+      detectedType: 'openssh',
+      conversion: true,
+      wrapping: 'openssh-headers-added',
+      finalFirstLine: key.split('\n')[0],
+    });
+    return key;
+  }
+
+  wrapped = true;
+  key = `-----BEGIN OPENSSH PRIVATE KEY-----\n${key}\n-----END OPENSSH PRIVATE KEY-----`;
+  console.log('[ForgeLite wrapKey] result', {
+    detectedType: inputType,
+    conversion: wrapped,
+    wrapping: 'openssh-headers-added-default',
+    finalFirstLine: key.split('\n')[0],
+  });
+  return key;
 }
 
 function decodeBase64(str) {
@@ -210,15 +370,6 @@ function extractPublicKeyFromOpenSSH(privateKey) {
   return encodeSshPublicLine(keyType, publicKeyBytes);
 }
 
-function detectKeyType(privateKey) {
-  if (privateKey.includes('OPENSSH PRIVATE KEY')) return 'openssh';
-  if (privateKey.includes('RSA PRIVATE KEY')) return 'rsa-pem';
-  if (privateKey.includes('EC PRIVATE KEY')) return 'ecdsa-pem';
-  if (privateKey.includes('DSA PRIVATE KEY')) return 'dsa-pem';
-  if (privateKey.includes('ENCRYPTED PRIVATE KEY')) return 'pkcs8-encrypted';
-  return 'unknown';
-}
-
 function extractPublicKeyFromPrivateKey(privateKey) {
   const keyType = detectKeyType(privateKey);
   if (keyType === 'openssh') {
@@ -294,6 +445,11 @@ function connectWithKeyPair(host, port, username, keyPair) {
 
 async function prepareKeyAuth(stored) {
   const privateKey = wrapKey(stored.key);
+
+  if (privateKey !== stored.key) {
+    await saveStoredKey(privateKey, stored.publicKey);
+  }
+
   let publicKey = stored.publicKey || null;
   let publicKeySource = stored.publicKey ? 'stored' : 'none';
 
@@ -696,15 +852,26 @@ export default function App() {
     }
 
     const storedKey = stored.key;
-    const preview =
-      storedKey.length > 60
-        ? storedKey.substring(0, 40) +
-          '...' +
-          storedKey.substring(storedKey.length - 20)
-        : storedKey;
-    const lineCount = storedKey.split('\n').length;
+    const lines = storedKey.split('\n');
+    const lineCount = lines.length;
+    const firstLines = lines.slice(0, 3).join('\n');
+    const lastLines = lines.slice(Math.max(0, lineCount - 3)).join('\n');
+    const processedKey = wrapKey(storedKey);
+    const storedType = detectKeyType(storedKey);
+    const effectiveType = detectKeyType(processedKey);
+    const wasRepaired = processedKey !== storedKey;
 
-    appendOutput(`\nStored key preview:\n${preview}\n(${lineCount} lines)\n\n`);
+    appendOutput('\nStored key preview:\n');
+    appendOutput(`--- first 3 lines ---\n${firstLines}\n`);
+    appendOutput(`--- last 3 lines ---\n${lastLines}\n`);
+    appendOutput(`(${lineCount} lines)\n`);
+    appendOutput(`stored key type: ${storedType}\n`);
+    appendOutput(`effective key type: ${effectiveType}\n`);
+    if (wasRepaired) {
+      appendOutput('note: key will be repaired on use (RSA body was in OpenSSH headers)\n');
+      appendOutput(`repaired first line: ${processedKey.split('\n')[0]}\n`);
+    }
+    appendOutput('\n');
     appendOutput(PROMPT);
   }, [appendOutput]);
 
