@@ -28,8 +28,9 @@ const STARTUP_TEXT =
   'Install the latest Sentinel: https://sentinelprime.org\n\n' +
   'Commands:\n' +
   '  ssh user@host        Connect to a remote machine\n' +
-  '  ssh-add              Import an SSH private key\n' +
+  '  ssh-add              Import SSH PRIVATE key (id_ed25519, NOT .pub)\n' +
   '  ssh-keys             List stored keys\n' +
+  '  ssh-show             Preview stored private key\n' +
   "  ssh-remove [n]       Remove a stored key\n" +
   '  ssh-debug            Show key auth diagnostics\n\n' +
   PROMPT;
@@ -331,6 +332,18 @@ async function prepareKeyAuth(stored) {
   };
 }
 
+function isPublicKeyContent(keyContent) {
+  if (/-----BEGIN.*PRIVATE KEY-----/.test(keyContent)) {
+    return false;
+  }
+
+  return (
+    keyContent.includes('ssh-ed25519') ||
+    keyContent.includes('ssh-rsa') ||
+    keyContent.includes('ssh-ecdsa')
+  );
+}
+
 function parseRemoveIndex(line) {
   const match = line.trim().match(/^ssh-remove(?:\s+(\d+))?$/i);
   if (!match) return null;
@@ -565,6 +578,14 @@ export default function App() {
         return;
       }
 
+      if (isPublicKeyContent(keyMaterial)) {
+        appendOutput('\nError: that is a PUBLIC key, not a private key.\n');
+        appendOutput('You need the PRIVATE key file: id_ed25519 (no .pub extension)\n');
+        appendOutput('On your PC run: cat ~/.ssh/id_ed25519\n\n');
+        appendOutput(PROMPT);
+        return;
+      }
+
       let publicKey = null;
 
       try {
@@ -598,8 +619,9 @@ export default function App() {
     setInput('');
     setMode('keypaste');
     appendOutput(
-      "Paste your private key content and type 'done' when finished.\n" +
-        '(Headers and footers are optional)\n',
+      'Note: Use your PRIVATE key (id_ed25519 or id_rsa, never the .pub file)\n' +
+        'On your PC: cat ~/.ssh/id_ed25519\n' +
+        "Paste your private key content and type 'done' when finished:\n",
     );
     inputRef.current?.focus();
   }, [appendOutput]);
@@ -661,6 +683,28 @@ export default function App() {
       'library: @dylankenneally/react-native-ssh-sftp (iOS NMSSH/libssh2)\n',
     );
     appendOutput('=== end ssh-debug ===\n\n');
+    appendOutput(PROMPT);
+  }, [appendOutput]);
+
+  const showStoredKey = useCallback(async () => {
+    const stored = await loadStoredKey();
+
+    if (!stored?.key) {
+      appendOutput('\nNo key stored.\n\n');
+      appendOutput(PROMPT);
+      return;
+    }
+
+    const storedKey = stored.key;
+    const preview =
+      storedKey.length > 60
+        ? storedKey.substring(0, 40) +
+          '...' +
+          storedKey.substring(storedKey.length - 20)
+        : storedKey;
+    const lineCount = storedKey.split('\n').length;
+
+    appendOutput(`\nStored key preview:\n${preview}\n(${lineCount} lines)\n\n`);
     appendOutput(PROMPT);
   }, [appendOutput]);
 
@@ -808,6 +852,11 @@ export default function App() {
       return;
     }
 
+    if (lower === 'ssh-show') {
+      await showStoredKey();
+      return;
+    }
+
     if (lower === 'ssh-debug') {
       await runSshDebug();
       return;
@@ -855,6 +904,7 @@ export default function App() {
     startKeyPaste,
     finishKeyPaste,
     listSshKeys,
+    showStoredKey,
     runSshDebug,
     removeSshKey,
     beginSshConnect,
