@@ -330,6 +330,159 @@ function encodeSshPublicLine(keyType, keyBytes) {
   return `${keyType} ${encoded}`;
 }
 
+function concatUint8Arrays(arrays) {
+  const totalLength = arrays.reduce((sum, part) => sum + part.length, 0);
+  const combined = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const part of arrays) {
+    combined.set(part, offset);
+    offset += part.length;
+  }
+  return combined;
+}
+
+function encodeSshStringBytes(value) {
+  const bytes = typeof value === 'string' ? new TextEncoder().encode(value) : value;
+  const out = new Uint8Array(4 + bytes.length);
+  new DataView(out.buffer).setUint32(0, bytes.length);
+  out.set(bytes, 4);
+  return out;
+}
+
+function encodeMpint(integerBytes) {
+  let bytes = integerBytes instanceof Uint8Array ? integerBytes : new Uint8Array(integerBytes);
+  let start = 0;
+
+  while (start < bytes.length - 1 && bytes[start] === 0 && (bytes[start + 1] & 0x80) === 0) {
+    start += 1;
+  }
+
+  bytes = bytes.slice(start);
+
+  if (bytes.length > 0 && (bytes[0] & 0x80) !== 0) {
+    const padded = new Uint8Array(bytes.length + 1);
+    padded[0] = 0;
+    padded.set(bytes, 1);
+    bytes = padded;
+  }
+
+  const out = new Uint8Array(4 + bytes.length);
+  new DataView(out.buffer).setUint32(0, bytes.length);
+  out.set(bytes, 4);
+  return out;
+}
+
+function encodeSshRsaPublicKey(modulusBytes, exponentBytes) {
+  const wire = concatUint8Arrays([
+    encodeSshStringBytes('ssh-rsa'),
+    encodeMpint(exponentBytes),
+    encodeMpint(modulusBytes),
+  ]);
+
+  let binary = '';
+  for (let i = 0; i < wire.length; i += 1) {
+    binary += String.fromCharCode(wire[i]);
+  }
+
+  return `ssh-rsa ${globalThis.btoa(binary)}`;
+}
+
+function readAsn1Length(bytes, offset) {
+  const first = bytes[offset];
+  if (first < 0x80) {
+    return { length: first, next: offset + 1 };
+  }
+
+  const numBytes = first & 0x7f;
+  let length = 0;
+  for (let i = 0; i < numBytes; i += 1) {
+    length = (length << 8) | bytes[offset + 1 + i];
+  }
+
+  return { length, next: offset + 1 + numBytes };
+}
+
+function readAsn1Integer(bytes, offset) {
+  if (bytes[offset] !== 0x02) {
+    throw new Error('Expected ASN.1 INTEGER');
+  }
+
+  const lengthInfo = readAsn1Length(bytes, offset + 1);
+  const start = lengthInfo.next;
+  return {
+    value: bytes.slice(start, start + lengthInfo.length),
+    next: start + lengthInfo.length,
+  };
+}
+
+function readAsn1Sequence(bytes, offset) {
+  if (bytes[offset] !== 0x30) {
+    throw new Error('Expected ASN.1 SEQUENCE');
+  }
+
+  const lengthInfo = readAsn1Length(bytes, offset + 1);
+  const start = lengthInfo.next;
+  return {
+    contents: bytes.slice(start, start + lengthInfo.length),
+    next: start + lengthInfo.length,
+  };
+}
+
+function parsePkcs1RsaPrivateKey(derBytes) {
+  const sequence = readAsn1Sequence(derBytes, 0);
+  let offset = 0;
+
+  const version = readAsn1Integer(sequence.contents, offset);
+  offset = version.next;
+
+  const modulus = readAsn1Integer(sequence.contents, offset);
+  offset = modulus.next;
+
+  const publicExponent = readAsn1Integer(sequence.contents, offset);
+
+  return {
+    modulus: modulus.value,
+    publicExponent: publicExponent.value,
+  };
+}
+
+function getRsaPemBody(privateKey) {
+  return privateKey
+    .replace(/-----BEGIN RSA PRIVATE KEY-----/g, '')
+    .replace(/-----END RSA PRIVATE KEY-----/g, '')
+    .replace(/\s/g, '');
+}
+
+function deriveRsaPublicKey(privateKey) {
+  const keyType = detectKeyType(privateKey);
+  if (keyType !== 'rsa-pem' && keyType !== 'rsa-pem-body') {
+    throw new Error(`deriveRsaPublicKey requires RSA PEM key, got ${keyType}`);
+  }
+
+  try {
+    const derBytes = decodeBase64(getRsaPemBody(privateKey));
+    const { modulus, publicExponent } = parsePkcs1RsaPrivateKey(derBytes);
+    const publicKey = encodeSshRsaPublicKey(modulus, publicExponent);
+    const fingerprintPreview = `${publicKey.split(/\s+/)[1]?.slice(0, 24) || ''}...`;
+
+    console.log('[ForgeLite RSA] public key derivation success', {
+      algorithm: 'ssh-rsa',
+      derivedKeyLength: publicKey.length,
+      fingerprintPreview,
+      modulusBytes: modulus.length,
+      exponentBytes: publicExponent.length,
+    });
+
+    return publicKey;
+  } catch (error) {
+    console.error('[ForgeLite RSA] public key derivation failure', {
+      error: formatAuthError(error),
+      keyType,
+    });
+    throw error;
+  }
+}
+
 function extractPublicKeyFromOpenSSH(privateKey) {
   const body = privateKey
     .replace(/-----BEGIN [^-]+-----/g, '')
@@ -372,10 +525,27 @@ function extractPublicKeyFromOpenSSH(privateKey) {
 
 function extractPublicKeyFromPrivateKey(privateKey) {
   const keyType = detectKeyType(privateKey);
-  if (keyType === 'openssh') {
-    return extractPublicKeyFromOpenSSH(privateKey);
+
+  if (keyType === 'openssh' || keyType === 'openssh-body') {
+    return {
+      publicKey: extractPublicKeyFromOpenSSH(privateKey),
+      source: 'derived-openssh',
+    };
   }
+
+  if (keyType === 'rsa-pem' || keyType === 'rsa-pem-body') {
+    return {
+      publicKey: deriveRsaPublicKey(privateKey),
+      source: 'derived-rsa',
+    };
+  }
+
   return null;
+}
+
+function getPublicKeyAlgorithm(publicKey) {
+  if (!publicKey) return '(none)';
+  return publicKey.split(/\s+/)[0] || '(unknown)';
 }
 
 function formatAuthError(error) {
@@ -414,7 +584,7 @@ function classifyAuthFailure(message) {
   return 'unknown';
 }
 
-function diagnoseStoredKey(privateKey, publicKey) {
+function diagnoseStoredKey(privateKey, publicKey, publicKeySource = 'none') {
   const lines = privateKey.split('\n');
   return {
     firstLine: lines[0] || '(empty)',
@@ -425,6 +595,10 @@ function diagnoseStoredKey(privateKey, publicKey) {
     hasCrlf: privateKey.includes('\r'),
     keyType: detectKeyType(privateKey),
     publicKeyExtracted: Boolean(publicKey),
+    publicKeySource,
+    publicKeyAlgorithm: getPublicKeyAlgorithm(publicKey),
+    derivedKeyLength: publicKey ? publicKey.length : 0,
+    publicKeyPassedToClient: Boolean(publicKey),
     publicKeyPreview: publicKey
       ? `${publicKey.split(/\s+/)[0]} ${(publicKey.split(/\s+/)[1] || '').slice(0, 24)}...`
       : '(none)',
@@ -455,9 +629,10 @@ async function prepareKeyAuth(stored) {
 
   if (!publicKey) {
     try {
-      publicKey = extractPublicKeyFromPrivateKey(privateKey);
-      if (publicKey) {
-        publicKeySource = 'extracted';
+      const extracted = extractPublicKeyFromPrivateKey(privateKey);
+      if (extracted?.publicKey) {
+        publicKey = extracted.publicKey;
+        publicKeySource = extracted.source;
       }
     } catch (error) {
       return {
@@ -466,9 +641,13 @@ async function prepareKeyAuth(stored) {
         publicKeySource: 'extraction-failed',
         keyType: detectKeyType(privateKey),
         extractionError: formatAuthError(error),
-        diagnostics: diagnoseStoredKey(privateKey, null),
+        diagnostics: diagnoseStoredKey(privateKey, null, 'extraction-failed'),
       };
     }
+  }
+
+  if (publicKey && publicKeySource.startsWith('derived')) {
+    await saveStoredKey(privateKey, publicKey);
   }
 
   let nativeKeyDetails = null;
@@ -484,7 +663,7 @@ async function prepareKeyAuth(stored) {
     publicKeySource,
     keyType: detectKeyType(privateKey),
     nativeKeyDetails,
-    diagnostics: diagnoseStoredKey(privateKey, publicKey),
+    diagnostics: diagnoseStoredKey(privateKey, publicKey, publicKeySource),
   };
 }
 
@@ -621,9 +800,19 @@ export default function App() {
         authMethod: 'publickey',
         keyType: authPrep.keyType,
         publicKeySource: authPrep.publicKeySource,
+        publicKeyAlgorithm: authPrep.diagnostics.publicKeyAlgorithm,
+        publicKeyPassedToClient: authPrep.diagnostics.publicKeyPassedToClient,
+        derivedKeyLength: authPrep.diagnostics.derivedKeyLength,
         privateKeyFirstLine: authPrep.diagnostics.firstLine,
         privateKeyLength: authPrep.diagnostics.totalLength,
         publicKeyPreview: authPrep.diagnostics.publicKeyPreview,
+        sshClientAuthObject: {
+          privateKey: '[redacted]',
+          publicKey: authPrep.publicKey
+            ? `${authPrep.diagnostics.publicKeyAlgorithm} (${authPrep.diagnostics.derivedKeyLength} chars)`
+            : null,
+          passphrase: passphrase ? '[set]' : '[empty]',
+        },
       });
 
       const client = await connectWithKeyPair(
@@ -743,9 +932,14 @@ export default function App() {
       }
 
       let publicKey = null;
+      let publicKeySource = 'none';
 
       try {
-        publicKey = extractPublicKeyFromPrivateKey(keyMaterial);
+        const extracted = extractPublicKeyFromPrivateKey(keyMaterial);
+        if (extracted?.publicKey) {
+          publicKey = extracted.publicKey;
+          publicKeySource = extracted.source;
+        }
       } catch (error) {
         appendOutput(
           `Warning: could not extract public key (${formatAuthError(error)}).\n`,
@@ -756,7 +950,7 @@ export default function App() {
       appendOutput('Key saved successfully.\n');
       appendOutput(`  type: ${detectKeyType(keyMaterial)}\n`);
       appendOutput(
-        `  public key: ${publicKey ? 'extracted and stored' : 'not extracted'}\n\n`,
+        `  public key: ${publicKey ? `${publicKeySource} (${getPublicKeyAlgorithm(publicKey)})` : 'not extracted'}\n\n`,
       );
       appendOutput(PROMPT);
     },
@@ -803,6 +997,11 @@ export default function App() {
     );
     appendOutput(`key type detected: ${authPrep.keyType}\n`);
     appendOutput(`public key source: ${authPrep.publicKeySource}\n`);
+    appendOutput(`public key algorithm: ${authPrep.diagnostics.publicKeyAlgorithm}\n`);
+    appendOutput(`derived key length: ${authPrep.diagnostics.derivedKeyLength}\n`);
+    appendOutput(
+      `publicKey passed to SSHClient: ${authPrep.diagnostics.publicKeyPassedToClient ? 'yes' : 'no'}\n`,
+    );
     appendOutput(`public key preview: ${authPrep.diagnostics.publicKeyPreview}\n`);
 
     if (authPrep.extractionError) {
