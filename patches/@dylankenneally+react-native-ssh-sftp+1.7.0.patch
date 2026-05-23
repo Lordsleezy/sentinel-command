@@ -25,13 +25,14 @@ new mode 100755
 diff --git a/node_modules/@dylankenneally/react-native-ssh-sftp/ios/RNSSHClient.m b/node_modules/@dylankenneally/react-native-ssh-sftp/ios/RNSSHClient.m
 old mode 100644
 new mode 100755
-index 069031e..9f01bfe
+index 069031e..07b700a
 --- a/node_modules/@dylankenneally/react-native-ssh-sftp/ios/RNSSHClient.m
 +++ b/node_modules/@dylankenneally/react-native-ssh-sftp/ios/RNSSHClient.m
-@@ -1,6 +1,13 @@
+@@ -1,6 +1,14 @@
  #import <React/RCTUtils.h>
  #import "RNSSHClient.h"
  #import "SSHClient.h"
++#import <Foundation/Foundation.h>
 +#import <sys/socket.h>
 +#import <netinet/in.h>
 +#import <arpa/inet.h>
@@ -42,7 +43,7 @@ index 069031e..9f01bfe
  
  @implementation RNSSHClient {
      NSMutableDictionary* _clientPool;
-@@ -15,7 +22,18 @@ RCT_EXPORT_MODULE();
+@@ -15,7 +23,18 @@ RCT_EXPORT_MODULE();
  
  - (NSArray<NSString *> *)supportedEvents
  {
@@ -62,7 +63,7 @@ index 069031e..9f01bfe
  }
  
  - (NSMutableDictionary*) clientPool {
-@@ -51,23 +69,235 @@ RCT_EXPORT_MODULE();
+@@ -51,23 +70,235 @@ RCT_EXPORT_MODULE();
      }
  }
  
@@ -268,8 +269,8 @@ index 069031e..9f01bfe
 +
 +    [self emitTrace:@"transport-kex-result" detail:@{
 +        @"sessionCreated": @(session != nil),
-+        @"isConnected": @(session.isConnected),
-+        @"isAuthorized": @(session.isAuthorized),
++        @"isConnected": @(session != nil ? session.isConnected : NO),
++        @"isAuthorized": @(session != nil ? session.isAuthorized : NO),
 +    } clientKey:key];
 +
      if (session && session.isConnected) {
@@ -298,7 +299,7 @@ index 069031e..9f01bfe
                  SSHClient* client = [[SSHClient alloc] init];
                  client._session = session;
                  client._key = key;
-@@ -77,15 +307,34 @@ RCT_EXPORT_METHOD(connectToHost:(NSString *)host
+@@ -77,15 +308,34 @@ RCT_EXPORT_METHOD(connectToHost:(NSString *)host
              }
              else
              {
@@ -333,7 +334,7 @@ index 069031e..9f01bfe
          NSLog(@"Connection to host %@ failed", host);
          callback(@[[NSString stringWithFormat:@"Connection to host %@ failed, without session", host]]);
        }
-@@ -119,18 +368,40 @@ RCT_EXPORT_METHOD(startShell:(nonnull NSString*)key
+@@ -119,18 +369,40 @@ RCT_EXPORT_METHOD(startShell:(nonnull NSString*)key
      SSHClient* client = [self clientForKey:key];
      if (client) {
          client.delegate = self;
@@ -351,7 +352,7 @@ index 069031e..9f01bfe
 +
              [client startShell:ptyType error:&error];
              if (error) {
-+                NSString *reason = [NSString stringWithFormat:@"Error starting shell: %@", error.localizedDescription ?: error];
++                NSString *reason = [NSString stringWithFormat:@"Error starting shell: %@", error.localizedDescription ?: [error description]];
 +                [self emitTrace:@"shell-request-failure" detail:@{
 +                    @"ptyType": ptyType ?: @"vanilla",
 +                    @"reason": reason,
