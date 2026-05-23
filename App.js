@@ -37,7 +37,9 @@ const STARTUP_TEXT =
   '  ssh-show             Preview stored private key\n' +
   "  ssh-remove [n]       Remove a stored key\n" +
   '  ssh-debug            Show key auth diagnostics\n' +
-  '  ssh-trace [user@host]  Trace full SSH connection lifecycle\n\n' +
+  '  ssh-trace [user@host]  Trace full SSH connection lifecycle\n' +
+  '  ssh-probe host[:port]  Raw TCP + SSH banner probe\n' +
+  '  ssh-password-test user@host  Password-only transport/auth test\n\n' +
   PROMPT;
 
 const MONO_FONT = Platform.select({
@@ -848,6 +850,149 @@ function parseSshTraceCommand(line) {
   return { type: 'invalid' };
 }
 
+function parseSshProbeCommand(line) {
+  const trimmed = line.trim();
+  if (!trimmed.toLowerCase().startsWith('ssh-probe ')) {
+    return { type: 'invalid' };
+  }
+
+  const arg = trimmed.slice('ssh-probe '.length).trim();
+  if (!arg) {
+    return { type: 'invalid' };
+  }
+
+  let host = arg;
+  let port = 22;
+
+  if (arg.includes(':')) {
+    const parts = arg.split(':');
+    host = parts[0];
+    port = parseInt(parts[1], 10) || 22;
+  }
+
+  if (!host) {
+    return { type: 'invalid' };
+  }
+
+  return { type: 'ok', host, port };
+}
+
+function parseSshPasswordTestCommand(line) {
+  const trimmed = line.trim();
+  if (!trimmed.toLowerCase().startsWith('ssh-password-test ')) {
+    return { type: 'invalid' };
+  }
+
+  return parseSshCommand(`ssh ${trimmed.slice('ssh-password-test '.length)}`);
+}
+
+function probeSshHost(host, port, timeoutMs = 8000) {
+  return new Promise((resolve, reject) => {
+    if (!RNSSHClient?.probeSshHost) {
+      reject(new Error('ssh-probe unavailable on this platform (requires iOS native build)'));
+      return;
+    }
+
+    RNSSHClient.probeSshHost(host, port, timeoutMs, (error, result) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve(result);
+    });
+  });
+}
+
+async function runTracedPasswordConnection(target, password, options = {}) {
+  const trace = createTraceTimeline();
+  let nativeUnsubscribe = attachNativeTraceListener(trace, null);
+  let client = null;
+
+  const cleanup = () => {
+    if (nativeUnsubscribe) {
+      nativeUnsubscribe.remove();
+      nativeUnsubscribe = null;
+    }
+  };
+
+  try {
+    trace.mark('socket-connect-start', {
+      host: target.host,
+      port: target.port,
+      username: target.username,
+      authMethod: 'password-only-test',
+    });
+    trace.mark('transport-kex-start', {
+      note: 'Password-only NMSSH connect (no key auth)',
+    });
+
+    client = await new Promise((resolve, reject) => {
+      const instance = new SSHClient(
+        target.host,
+        target.port,
+        target.username,
+        password,
+        (error) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+          resolve(instance);
+        },
+      );
+    });
+
+    const clientKey = client._key;
+    cleanup();
+    nativeUnsubscribe = attachNativeTraceListener(trace, clientKey);
+
+    trace.mark('handshake-complete', {
+      note: 'Native password connect callback succeeded',
+    });
+    trace.mark('auth-complete', {
+      note: 'NMSSH session.isAuthorized expected true for password test',
+    });
+
+    const sessionStatus = await getNativeSessionStatus(clientKey);
+    trace.mark('session-status', sessionStatus);
+
+    if (!sessionStatus.isConnected) {
+      const transportError = new Error('Password test failed before transport: isConnected=false');
+      trace.setFailure('CONNECTION_FAILURE', transportError);
+      throw transportError;
+    }
+
+    if (!sessionStatus.isAuthorized) {
+      const authError = new Error('Password test failed at auth: isAuthorized=false');
+      trace.setFailure('AUTH_FAILURE', authError);
+      throw authError;
+    }
+
+    if (!options.skipShell) {
+      const ptyType = options.ptyType || 'vanilla';
+      trace.mark('pty-request-start', { ptyType });
+      trace.mark('shell-request-start', { ptyType });
+      await client.startShell(ptyType);
+      trace.mark('shell-open-success', { ptyType });
+      trace.mark('stream-open', { ptyType });
+    }
+
+    return { trace, client, success: true };
+  } catch (error) {
+    trace.mark('disconnect-reason', {
+      stage: trace.failureStage || classifyFailureFromStage('connection', error),
+    }, error);
+
+    if (!trace.failureStage) {
+      trace.setFailure(classifyFailureFromStage('connection', error), error);
+    }
+
+    return { trace, client, success: false, error };
+  } finally {
+    cleanup();
+  }
+}
+
 function diagnoseStoredKey(privateKey, publicKey, publicKeySource = 'none') {
   const lines = privateKey.split('\n');
   return {
@@ -1236,6 +1381,53 @@ export default function App() {
     inputRef.current?.focus();
   }, [appendOutput]);
 
+  const runSshProbe = useCallback(
+    async (host, port) => {
+      appendOutput('=== ssh-probe ===\n');
+      appendOutput(`target: ${host}:${port}\n`);
+
+      try {
+        const result = await probeSshHost(host, port);
+        appendOutput(`tcp connect: ${result.tcpConnect}\n`);
+        appendOutput(`latency: ${result.latencyMs}ms\n`);
+        appendOutput(`ssh banner received: ${result.sshBannerReceived ? 'yes' : 'no'}\n`);
+        if (result.banner) {
+          appendOutput(`banner: ${result.banner}\n`);
+        }
+        appendOutput(`disconnect stage: ${result.disconnectStage || 'none'}\n`);
+        if (result.error) {
+          appendOutput(`error: ${result.error}\n`);
+        }
+        if (result.rawData) {
+          appendOutput(`raw data: ${result.rawData}\n`);
+        }
+      } catch (error) {
+        appendOutput(`tcp connect: failure\n`);
+        appendOutput(`latency: n/a\n`);
+        appendOutput('ssh banner received: no\n');
+        appendOutput(`error: ${formatAuthError(error)}\n`);
+        appendOutput('disconnect stage: tcp\n');
+      }
+
+      appendOutput('=== end ssh-probe ===\n\n');
+      appendOutput(PROMPT);
+    },
+    [appendOutput],
+  );
+
+  const startPasswordTest = useCallback(
+    (target) => {
+      lastSshTargetRef.current = target;
+      setPending({ ...target, passwordTest: true });
+      setMode('password');
+      appendOutput(
+        `Password-only test for ${target.username}@${target.host} (no key auth): `,
+      );
+      inputRef.current?.focus();
+    },
+    [],
+  );
+
   const runSshTrace = useCallback(
     async (targetOverride = null) => {
       const target = targetOverride || lastSshTargetRef.current;
@@ -1501,6 +1693,67 @@ export default function App() {
         return;
       }
 
+      if (target.passwordTest) {
+        appendOutput(`Running password-only transport test to ${target.host}:${target.port}...\n`);
+        const result = await runTracedPasswordConnection(target, password, {
+          skipShell: true,
+        });
+        lastTraceRef.current = result.trace;
+
+        appendOutput(`result: ${result.success ? 'success' : 'failure'}\n`);
+        appendOutput(
+          `failure class: ${result.trace.failureStage || (result.success ? 'none' : 'UNKNOWN_FAILURE')}\n`,
+        );
+        if (result.trace.failureMessage) {
+          appendOutput(`raw error: ${result.trace.failureMessage}\n`);
+        }
+
+        const sessionEvent = [...result.trace.events]
+          .reverse()
+          .find((entry) => entry.stage === 'session-status');
+        if (sessionEvent?.detail) {
+          appendOutput(
+            `session.isConnected: ${sessionEvent.detail.isConnected ? 'yes' : 'no'}\n`,
+          );
+          appendOutput(
+            `session.isAuthorized: ${sessionEvent.detail.isAuthorized ? 'yes' : 'no'}\n`,
+          );
+        }
+
+        appendOutput('--- timeline ---\n');
+        appendOutput(`${result.trace.formatTimeline()}\n`);
+
+        if (result.client) {
+          try {
+            result.client.disconnect();
+          } catch {
+            /* ignore */
+          }
+        }
+
+        if (result.success) {
+          appendOutput(
+            'Password auth succeeded — transport/KEX works; issue is likely publickey negotiation only.\n',
+          );
+        } else {
+          const beforeAuth = result.trace.events.some((entry) =>
+            ['auth-complete', 'auth-success', 'handshake-complete'].includes(entry.stage),
+          );
+          if (!beforeAuth) {
+            appendOutput(
+              'Failed before auth — NMSSH/libssh2 transport/KEX with Windows OpenSSH is failing.\n',
+            );
+          } else {
+            appendOutput('Failed during/after auth — check password or server auth settings.\n');
+          }
+        }
+
+        setMode('local');
+        setPending(null);
+        appendOutput(PROMPT);
+        return;
+      }
+
       if (!target.keyAuthFailed) {
         appendOutput(`Connecting to ${target.host}:${target.port}...\n`);
       }
@@ -1587,6 +1840,34 @@ export default function App() {
       return;
     }
 
+    const probeParsed = parseSshProbeCommand(trimmed);
+    if (probeParsed.type === 'ok') {
+      await runSshProbe(probeParsed.host, probeParsed.port);
+      return;
+    }
+    if (lower.startsWith('ssh-probe')) {
+      appendOutput('ssh-probe: invalid syntax. Use: ssh-probe host[:port]\n\n');
+      appendOutput(PROMPT);
+      return;
+    }
+
+    const passwordTestParsed = parseSshPasswordTestCommand(trimmed);
+    if (passwordTestParsed.type === 'ok') {
+      startPasswordTest({
+        username: passwordTestParsed.username,
+        host: passwordTestParsed.host,
+        port: passwordTestParsed.port,
+      });
+      return;
+    }
+    if (lower.startsWith('ssh-password-test')) {
+      appendOutput(
+        'ssh-password-test: invalid syntax. Use: ssh-password-test user@host\n\n',
+      );
+      appendOutput(PROMPT);
+      return;
+    }
+
     const removeIndex = parseRemoveIndex(trimmed);
     if (removeIndex !== null || lower === 'ssh-remove') {
       await removeSshKey(removeIndex);
@@ -1632,6 +1913,8 @@ export default function App() {
     showStoredKey,
     runSshDebug,
     runSshTrace,
+    runSshProbe,
+    startPasswordTest,
     removeSshKey,
     beginSshConnect,
   ]);
