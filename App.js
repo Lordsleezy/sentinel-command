@@ -3,6 +3,8 @@ import {
   InputAccessoryView,
   Keyboard,
   KeyboardAvoidingView,
+  NativeEventEmitter,
+  NativeModules,
   Platform,
   Pressable,
   ScrollView,
@@ -14,6 +16,8 @@ import {
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { StatusBar } from 'expo-status-bar';
 import SSHClient from '@dylankenneally/react-native-ssh-sftp';
+
+const { RNSSHClient } = NativeModules;
 
 const PROMPT = 'PS > ';
 const INPUT_ACCESSORY_ID = 'forge-lite-keyboard-dismiss';
@@ -32,7 +36,8 @@ const STARTUP_TEXT =
   '  ssh-keys             List stored keys\n' +
   '  ssh-show             Preview stored private key\n' +
   "  ssh-remove [n]       Remove a stored key\n" +
-  '  ssh-debug            Show key auth diagnostics\n\n' +
+  '  ssh-debug            Show key auth diagnostics\n' +
+  '  ssh-trace [user@host]  Trace full SSH connection lifecycle\n\n' +
   PROMPT;
 
 const MONO_FONT = Platform.select({
@@ -559,15 +564,39 @@ function formatAuthError(error) {
   }
 }
 
-function classifyAuthFailure(message) {
+function classifyAuthFailure(message, failedStage = null) {
+  if (failedStage) {
+    return failedStage;
+  }
+
   const lower = message.toLowerCase();
   if (
     lower.includes('authentication') ||
     lower.includes('auth failed') ||
-    lower.includes('not authorized') ||
-    lower.includes('permission denied')
+    lower.includes('not authorized')
   ) {
-    return 'server-rejected-or-auth-failed';
+    return 'AUTH_FAILURE';
+  }
+  if (lower.includes('permission denied')) {
+    return 'AUTH_FAILURE';
+  }
+  if (
+    lower.includes('starting shell') ||
+    lower.includes('shell') ||
+    lower.includes('pty')
+  ) {
+    if (lower.includes('pty')) return 'PTY_FAILURE';
+    return 'SHELL_FAILURE';
+  }
+  if (lower.includes('channel') || lower.includes('unknown client')) {
+    return 'CHANNEL_FAILURE';
+  }
+  if (
+    lower.includes('session not connected') ||
+    lower.includes('disconnect') ||
+    lower.includes('broken pipe')
+  ) {
+    return 'SOCKET_DISCONNECT';
   }
   if (
     lower.includes('parse') ||
@@ -576,12 +605,247 @@ function classifyAuthFailure(message) {
     lower.includes('base64') ||
     lower.includes('decode')
   ) {
-    return 'client-parse-failure';
+    return 'CLIENT_PARSE_FAILURE';
   }
   if (lower.includes('connect') || lower.includes('timeout') || lower.includes('network')) {
-    return 'connection-failure';
+    return 'CONNECTION_FAILURE';
   }
-  return 'unknown';
+  return 'UNKNOWN_FAILURE';
+}
+
+function classifyFailureFromStage(stage, error) {
+  const message = formatAuthError(error);
+  const lower = `${stage} ${message}`.toLowerCase();
+
+  if (stage.includes('auth') || lower.includes('authentication')) {
+    return 'AUTH_FAILURE';
+  }
+  if (stage.includes('pty')) {
+    return 'PTY_FAILURE';
+  }
+  if (stage.includes('shell')) {
+    return 'SHELL_FAILURE';
+  }
+  if (stage.includes('channel') || stage.includes('exec')) {
+    return 'CHANNEL_FAILURE';
+  }
+  if (stage.includes('socket') || stage.includes('handshake')) {
+    return 'CONNECTION_FAILURE';
+  }
+  if (stage.includes('disconnect')) {
+    return 'SOCKET_DISCONNECT';
+  }
+
+  return classifyAuthFailure(message);
+}
+
+function createTraceTimeline() {
+  const startedAt = Date.now();
+  const events = [];
+  const timeline = {
+    events,
+    failureStage: null,
+    failureMessage: null,
+    mark(stage, detail = {}, error = null) {
+      const entry = {
+        atMs: Date.now() - startedAt,
+        stage,
+        detail,
+        error: error ? formatAuthError(error) : null,
+        source: 'js',
+      };
+      events.push(entry);
+      console.log(`[ForgeLite SSH-TRACE] +${entry.atMs}ms ${stage}`, detail, entry.error || '');
+      return entry;
+    },
+    markNative(event) {
+      const entry = {
+        atMs: Date.now() - startedAt,
+        stage: event.stage || 'native-event',
+        detail: event,
+        error: event.reason || null,
+        source: 'native',
+      };
+      events.push(entry);
+      console.log(`[ForgeLite SSH-TRACE] +${entry.atMs}ms native:${entry.stage}`, event);
+      return entry;
+    },
+    setFailure(stage, error) {
+      timeline.failureStage = stage;
+      timeline.failureMessage = formatAuthError(error);
+    },
+    getSummary() {
+      if (timeline.failureStage) {
+        return `${timeline.failureStage}: ${timeline.failureMessage || 'unknown error'}`;
+      }
+      return 'success';
+    },
+    formatTimeline() {
+      return events
+        .map((entry) => {
+          const detailText = entry.detail
+            ? ` ${JSON.stringify(entry.detail)}`
+            : '';
+          const errorText = entry.error ? ` ERROR=${entry.error}` : '';
+          return `[+${entry.atMs}ms] ${entry.source}:${entry.stage}${detailText}${errorText}`;
+        })
+        .join('\n');
+    },
+  };
+
+  return timeline;
+}
+
+function attachNativeTraceListener(trace, clientKey) {
+  if (Platform.OS !== 'ios' || !RNSSHClient) {
+    return null;
+  }
+
+  const emitter = new NativeEventEmitter(RNSSHClient);
+  return emitter.addListener('SshTrace', (event) => {
+    if (clientKey && event.clientKey && event.clientKey !== clientKey) {
+      return;
+    }
+    trace.markNative(event);
+  });
+}
+
+function getNativeSessionStatus(clientKey) {
+  return new Promise((resolve) => {
+    if (!RNSSHClient?.getSessionStatus) {
+      resolve({ available: false });
+      return;
+    }
+
+    RNSSHClient.getSessionStatus(clientKey, (error, status) => {
+      if (error) {
+        resolve({
+          available: true,
+          error: formatAuthError(error),
+          isConnected: false,
+          isAuthorized: false,
+        });
+        return;
+      }
+
+      resolve({
+        available: true,
+        isConnected: Boolean(status?.isConnected),
+        isAuthorized: Boolean(status?.isAuthorized),
+        hasSession: Boolean(status?.hasSession),
+      });
+    });
+  });
+}
+
+function buildKeyPair(authPrep, passphrase = '') {
+  const keyPair = {
+    privateKey: authPrep.privateKey,
+    passphrase,
+  };
+
+  if (authPrep.publicKey) {
+    keyPair.publicKey = authPrep.publicKey;
+  }
+
+  return keyPair;
+}
+
+async function runTracedConnection(target, authPrep, options = {}) {
+  const trace = createTraceTimeline();
+  let nativeUnsubscribe = attachNativeTraceListener(trace, null);
+  let client = null;
+
+  const cleanup = () => {
+    if (nativeUnsubscribe) {
+      nativeUnsubscribe.remove();
+      nativeUnsubscribe = null;
+    }
+  };
+
+  try {
+    trace.mark('socket-connect-start', {
+      host: target.host,
+      port: target.port,
+      username: target.username,
+    });
+
+    client = await connectWithKeyPair(
+      target.host,
+      target.port,
+      target.username,
+      buildKeyPair(authPrep, options.passphrase || ''),
+    );
+
+    const clientKey = client._key;
+    cleanup();
+    nativeUnsubscribe = attachNativeTraceListener(trace, clientKey);
+
+    trace.mark('handshake-complete', {
+      note: 'Native connect callback succeeded',
+    });
+    trace.mark('auth-complete', {
+      note: 'Native layer returned success; NMSSH session.isAuthorized expected true',
+    });
+
+    const sessionStatus = await getNativeSessionStatus(clientKey);
+    trace.mark('session-status', sessionStatus);
+
+    trace.mark('channel-exec-start', { command: 'echo FORGE_TRACE' });
+    try {
+      const execOutput = await client.execute('echo FORGE_TRACE');
+      trace.mark('channel-exec-success', {
+        output: String(execOutput || '').trim().slice(0, 120),
+      });
+    } catch (execError) {
+      trace.mark('channel-exec-failure', {}, execError);
+      trace.setFailure('CHANNEL_FAILURE', execError);
+      throw execError;
+    }
+
+    if (!options.skipShell) {
+      const ptyType = options.ptyType || 'vanilla';
+      trace.mark('pty-request-start', { ptyType });
+      trace.mark('shell-request-start', { ptyType });
+
+      try {
+        await client.startShell(ptyType);
+        trace.mark('shell-open-success', { ptyType });
+        trace.mark('stream-open', { ptyType });
+      } catch (shellError) {
+        trace.mark('shell-request-failure', { ptyType }, shellError);
+        trace.setFailure(classifyFailureFromStage('shell-request-failure', shellError), shellError);
+        throw shellError;
+      }
+    }
+
+    return { trace, client, success: true };
+  } catch (error) {
+    trace.mark('disconnect-reason', {
+      stage: trace.failureStage || classifyFailureFromStage('connection', error),
+    }, error);
+
+    if (!trace.failureStage) {
+      trace.setFailure(classifyFailureFromStage('connection', error), error);
+    }
+
+    return { trace, client, success: false, error };
+  } finally {
+    cleanup();
+  }
+}
+
+function parseSshTraceCommand(line) {
+  const trimmed = line.trim();
+  if (trimmed.toLowerCase() === 'ssh-trace') {
+    return { type: 'use_last' };
+  }
+
+  if (trimmed.toLowerCase().startsWith('ssh-trace ')) {
+    return parseSshCommand(`ssh ${trimmed.slice('ssh-trace '.length)}`);
+  }
+
+  return { type: 'invalid' };
 }
 
 function diagnoseStoredKey(privateKey, publicKey, publicKeySource = 'none') {
@@ -693,6 +957,7 @@ export default function App() {
   const keyPasteLinesRef = useRef([]);
   const lastAuthDebugRef = useRef(null);
   const lastSshTargetRef = useRef(null);
+  const lastTraceRef = useRef(null);
 
   const [mode, setMode] = useState('local');
   const [output, setOutput] = useState(STARTUP_TEXT);
@@ -784,15 +1049,6 @@ export default function App() {
 
   const connectWithKey = useCallback(
     async (target, authPrep, passphrase = '') => {
-      const keyPair = {
-        privateKey: authPrep.privateKey,
-        passphrase,
-      };
-
-      if (authPrep.publicKey) {
-        keyPair.publicKey = authPrep.publicKey;
-      }
-
       console.log('[ForgeLite SSH] connectWithKey', {
         host: target.host,
         port: target.port,
@@ -803,33 +1059,32 @@ export default function App() {
         publicKeyAlgorithm: authPrep.diagnostics.publicKeyAlgorithm,
         publicKeyPassedToClient: authPrep.diagnostics.publicKeyPassedToClient,
         derivedKeyLength: authPrep.diagnostics.derivedKeyLength,
-        privateKeyFirstLine: authPrep.diagnostics.firstLine,
-        privateKeyLength: authPrep.diagnostics.totalLength,
         publicKeyPreview: authPrep.diagnostics.publicKeyPreview,
-        sshClientAuthObject: {
-          privateKey: '[redacted]',
-          publicKey: authPrep.publicKey
-            ? `${authPrep.diagnostics.publicKeyAlgorithm} (${authPrep.diagnostics.derivedKeyLength} chars)`
-            : null,
-          passphrase: passphrase ? '[set]' : '[empty]',
-        },
       });
 
-      const client = await connectWithKeyPair(
-        target.host,
-        target.port,
-        target.username,
-        keyPair,
-      );
-      await establishShell(client);
+      const result = await runTracedConnection(target, authPrep, { passphrase });
+      lastTraceRef.current = result.trace;
+
+      if (!result.success) {
+        throw result.error || new Error(result.trace.getSummary());
+      }
+
+      result.client.on('Shell', (data) => {
+        if (data) appendOutput(data);
+      });
+      sshClientRef.current = result.client;
+      setMode('ssh');
+      setPending(null);
+      setInput('');
     },
-    [establishShell],
+    [appendOutput],
   );
 
   const reportKeyAuthFailure = useCallback(
     (error, target, authPrep) => {
       const message = formatAuthError(error);
-      const failureClass = classifyAuthFailure(message);
+      const trace = lastTraceRef.current;
+      const failureClass = trace?.failureStage || classifyAuthFailure(message);
       const debug = {
         message,
         failureClass,
@@ -841,28 +1096,33 @@ export default function App() {
         nativeKeyDetails: authPrep.nativeKeyDetails || null,
         diagnostics: authPrep.diagnostics,
         rawError: error,
+        traceTimeline: trace?.formatTimeline() || null,
+        authSucceededBeforeFailure: trace?.events?.some((entry) =>
+          ['auth-complete', 'auth-success', 'js-auth-callback-success'].includes(entry.stage),
+        ),
       };
 
       lastAuthDebugRef.current = debug;
       console.error('[ForgeLite SSH] key auth failed', debug);
 
-      appendOutput(`Key auth failed: ${message}\n`);
+      appendOutput(`Connection failed: ${message}\n`);
       appendOutput(`  failure class: ${failureClass}\n`);
       appendOutput(`  auth method: publickey\n`);
       appendOutput(`  key type: ${authPrep.keyType}\n`);
       appendOutput(`  public key: ${authPrep.publicKeySource}\n`);
+      if (debug.authSucceededBeforeFailure) {
+        appendOutput('  auth succeeded before failure: yes\n');
+      } else {
+        appendOutput('  auth succeeded before failure: no\n');
+      }
       if (authPrep.extractionError) {
         appendOutput(`  public key extraction: ${authPrep.extractionError}\n`);
       }
-      if (authPrep.nativeKeyDetails?.keyType) {
-        appendOutput(
-          `  native parser: ${authPrep.nativeKeyDetails.keyType}` +
-            `${authPrep.nativeKeyDetails.keySize ? ` (${authPrep.nativeKeyDetails.keySize})` : ''}\n`,
-        );
-      } else if (authPrep.nativeKeyDetails?.error) {
-        appendOutput(`  native parser: ${authPrep.nativeKeyDetails.error}\n`);
+      if (trace?.events?.length) {
+        appendOutput('  Run ssh-trace for full lifecycle timeline.\n');
+      } else {
+        appendOutput('  Run ssh-debug for key details.\n');
       }
-      appendOutput(`  Run ssh-debug for full details.\n`);
     },
     [appendOutput],
   );
@@ -976,6 +1236,81 @@ export default function App() {
     inputRef.current?.focus();
   }, [appendOutput]);
 
+  const runSshTrace = useCallback(
+    async (targetOverride = null) => {
+      const target = targetOverride || lastSshTargetRef.current;
+      appendOutput('=== ssh-trace ===\n');
+
+      if (!target) {
+        appendOutput('No target. Use: ssh-trace user@host\n\n');
+        appendOutput(PROMPT);
+        return;
+      }
+
+      const stored = await loadStoredKey();
+      if (!stored?.key) {
+        appendOutput('No stored private key. Run ssh-add first.\n\n');
+        appendOutput(PROMPT);
+        return;
+      }
+
+      appendOutput(`target: ${target.username}@${target.host}:${target.port}\n`);
+      const authPrep = await prepareKeyAuth(stored);
+      appendOutput(`key type: ${authPrep.keyType}\n`);
+      appendOutput(`public key source: ${authPrep.publicKeySource}\n\n`);
+
+      const result = await runTracedConnection(target, authPrep, {
+        skipShell: false,
+      });
+      lastTraceRef.current = result.trace;
+
+      appendOutput('--- lifecycle timeline ---\n');
+      appendOutput(`${result.trace.formatTimeline()}\n`);
+      appendOutput('--- summary ---\n');
+      appendOutput(`result: ${result.success ? 'success' : 'failure'}\n`);
+      appendOutput(`failure class: ${result.trace.failureStage || (result.success ? 'none' : 'UNKNOWN_FAILURE')}\n`);
+
+      if (result.trace.failureMessage) {
+        appendOutput(`raw error: ${result.trace.failureMessage}\n`);
+      }
+
+      const sessionEvent = [...result.trace.events]
+        .reverse()
+        .find((entry) => entry.stage === 'session-status');
+      if (sessionEvent?.detail) {
+        appendOutput(
+          `session.isConnected: ${sessionEvent.detail.isConnected ? 'yes' : 'no'}\n`,
+        );
+        appendOutput(
+          `session.isAuthorized: ${sessionEvent.detail.isAuthorized ? 'yes' : 'no'}\n`,
+        );
+      }
+
+      const authBeforeFail = result.trace.events.some((entry) =>
+        ['auth-complete', 'auth-success'].includes(entry.stage),
+      );
+      appendOutput(`auth succeeded before failure: ${authBeforeFail ? 'yes' : 'no'}\n`);
+
+      if (result.client) {
+        try {
+          result.client.closeShell?.();
+        } catch {
+          /* ignore */
+        }
+        try {
+          result.client.disconnect();
+          appendOutput('disconnect: trace client closed\n');
+        } catch (disconnectError) {
+          appendOutput(`disconnect error: ${formatAuthError(disconnectError)}\n`);
+        }
+      }
+
+      appendOutput('=== end ssh-trace ===\n\n');
+      appendOutput(PROMPT);
+    },
+    [appendOutput],
+  );
+
   const runSshDebug = useCallback(async () => {
     const stored = await loadStoredKey();
     const target = lastSshTargetRef.current;
@@ -1026,6 +1361,11 @@ export default function App() {
     }
 
     appendOutput('auth method: publickey\n');
+
+    if (lastTraceRef.current) {
+      appendOutput(`last trace failure class: ${lastTraceRef.current.failureStage || 'none'}\n`);
+      appendOutput('(run ssh-trace for full lifecycle timeline)\n');
+    }
 
     if (lastAuthDebugRef.current) {
       appendOutput(`last auth failure class: ${lastAuthDebugRef.current.failureClass}\n`);
@@ -1228,6 +1568,25 @@ export default function App() {
       return;
     }
 
+    const traceParsed = parseSshTraceCommand(trimmed);
+    if (traceParsed.type === 'use_last') {
+      await runSshTrace();
+      return;
+    }
+    if (traceParsed.type === 'ok') {
+      await runSshTrace({
+        username: traceParsed.username,
+        host: traceParsed.host,
+        port: traceParsed.port,
+      });
+      return;
+    }
+    if (lower.startsWith('ssh-trace')) {
+      appendOutput('ssh-trace: invalid syntax. Use: ssh-trace user@host\n\n');
+      appendOutput(PROMPT);
+      return;
+    }
+
     const removeIndex = parseRemoveIndex(trimmed);
     if (removeIndex !== null || lower === 'ssh-remove') {
       await removeSshKey(removeIndex);
@@ -1272,6 +1631,7 @@ export default function App() {
     listSshKeys,
     showStoredKey,
     runSshDebug,
+    runSshTrace,
     removeSshKey,
     beginSshConnect,
   ]);

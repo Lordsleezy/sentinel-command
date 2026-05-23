@@ -1,0 +1,217 @@
+diff --git a/node_modules/@dylankenneally/react-native-ssh-sftp/LICENSE b/node_modules/@dylankenneally/react-native-ssh-sftp/LICENSE
+old mode 100644
+new mode 100755
+diff --git a/node_modules/@dylankenneally/react-native-ssh-sftp/README.md b/node_modules/@dylankenneally/react-native-ssh-sftp/README.md
+old mode 100644
+new mode 100755
+diff --git a/node_modules/@dylankenneally/react-native-ssh-sftp/RNSSHClient.podspec b/node_modules/@dylankenneally/react-native-ssh-sftp/RNSSHClient.podspec
+old mode 100644
+new mode 100755
+diff --git a/node_modules/@dylankenneally/react-native-ssh-sftp/android/build.gradle b/node_modules/@dylankenneally/react-native-ssh-sftp/android/build.gradle
+old mode 100644
+new mode 100755
+diff --git a/node_modules/@dylankenneally/react-native-ssh-sftp/android/src/main/AndroidManifest.xml b/node_modules/@dylankenneally/react-native-ssh-sftp/android/src/main/AndroidManifest.xml
+old mode 100644
+new mode 100755
+diff --git a/node_modules/@dylankenneally/react-native-ssh-sftp/android/src/main/java/me/keeex/rnssh/RNSshClientModule.java b/node_modules/@dylankenneally/react-native-ssh-sftp/android/src/main/java/me/keeex/rnssh/RNSshClientModule.java
+old mode 100644
+new mode 100755
+diff --git a/node_modules/@dylankenneally/react-native-ssh-sftp/android/src/main/java/me/keeex/rnssh/RNSshClientPackage.java b/node_modules/@dylankenneally/react-native-ssh-sftp/android/src/main/java/me/keeex/rnssh/RNSshClientPackage.java
+old mode 100644
+new mode 100755
+diff --git a/node_modules/@dylankenneally/react-native-ssh-sftp/ios/RNSSHClient.h b/node_modules/@dylankenneally/react-native-ssh-sftp/ios/RNSSHClient.h
+old mode 100644
+new mode 100755
+diff --git a/node_modules/@dylankenneally/react-native-ssh-sftp/ios/RNSSHClient.m b/node_modules/@dylankenneally/react-native-ssh-sftp/ios/RNSSHClient.m
+old mode 100644
+new mode 100755
+index 069031e..8c1a056
+--- a/node_modules/@dylankenneally/react-native-ssh-sftp/ios/RNSSHClient.m
++++ b/node_modules/@dylankenneally/react-native-ssh-sftp/ios/RNSSHClient.m
+@@ -15,7 +15,18 @@ RCT_EXPORT_MODULE();
+ 
+ - (NSArray<NSString *> *)supportedEvents
+ {
+-    return @[@"Shell", @"DownloadProgress", @"UploadProgress"];
++    return @[@"Shell", @"DownloadProgress", @"UploadProgress", @"SshTrace"];
++}
++
++- (void)emitTrace:(NSString *)stage detail:(NSDictionary *)detail clientKey:(NSString *)clientKey {
++    NSMutableDictionary *payload = [NSMutableDictionary dictionaryWithDictionary:detail ?: @{}];
++    payload[@"stage"] = stage;
++    payload[@"timestamp"] = @([[NSDate date] timeIntervalSince1970] * 1000.0);
++    if (clientKey) {
++        payload[@"clientKey"] = clientKey;
++    }
++    NSLog(@"[ForgeLite SshTrace] %@ %@", stage, payload);
++    [self sendEventWithName:@"SshTrace" body:payload];
+ }
+ 
+ - (NSMutableDictionary*) clientPool {
+@@ -51,23 +62,62 @@ RCT_EXPORT_MODULE();
+     }
+ }
+ 
++RCT_EXPORT_METHOD(getSessionStatus:(nonnull NSString*)key
++                  withCallback:(RCTResponseSenderBlock)callback) {
++    SSHClient* client = [self clientForKey:key];
++    if (!client || !client._session) {
++        callback(@[[NSNull null], @{
++            @"isConnected": @NO,
++            @"isAuthorized": @NO,
++            @"hasSession": @NO,
++        }]);
++        return;
++    }
++
++    callback(@[[NSNull null], @{
++        @"isConnected": @(client._session.isConnected),
++        @"isAuthorized": @(client._session.isAuthorized),
++        @"hasSession": @YES,
++    }]);
++}
++
+ RCT_EXPORT_METHOD(connectToHost:(NSString *)host
+                   port:(NSInteger)port
+                   withUsername:(NSString *)username
+                   passwordOrKey:(id) passwordOrKey // password or {privateKey: value, [publicKey: value, passphrase: value]}
+                   withKey:(nonnull NSString*)key
+                   withCallback:(RCTResponseSenderBlock)callback){
++    [self emitTrace:@"socket-connect-start" detail:@{
++        @"host": host ?: @"",
++        @"port": @(port),
++        @"username": username ?: @"",
++    } clientKey:key];
++
+     NMSSHSession* session = [NMSSHSession connectToHost:host
+                                                    port:port
+                                            withUsername:username];
+     if (session && session.isConnected) {
++        [self emitTrace:@"handshake-complete" detail:@{
++            @"isConnected": @(session.isConnected),
++            @"isAuthorized": @(session.isAuthorized),
++        } clientKey:key];
++
+         dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
++        [self emitTrace:@"auth-attempt-start" detail:@{
++            @"method": [passwordOrKey isKindOfClass:[NSString class]] ? @"password" : @"publickey",
++        } clientKey:key];
++
+         if ([passwordOrKey isKindOfClass:[NSString class]])
+             [session authenticateByPassword:passwordOrKey];
+         else
+             [session authenticateByInMemoryPublicKey:[passwordOrKey objectForKey:@"publicKey"] privateKey:[passwordOrKey objectForKey:@"privateKey"] andPassword:[passwordOrKey objectForKey:@"passphrase"]];
+ 
+             if (session.isAuthorized) {
++                [self emitTrace:@"auth-success" detail:@{
++                    @"isConnected": @(session.isConnected),
++                    @"isAuthorized": @(session.isAuthorized),
++                } clientKey:key];
++
+                 SSHClient* client = [[SSHClient alloc] init];
+                 client._session = session;
+                 client._key = key;
+@@ -77,15 +127,28 @@ RCT_EXPORT_METHOD(connectToHost:(NSString *)host
+             }
+             else
+             {
++                [self emitTrace:@"auth-failure" detail:@{
++                    @"isConnected": @(session.isConnected),
++                    @"isAuthorized": @(session.isAuthorized),
++                    @"reason": [NSString stringWithFormat:@"Authentication to host %@ failed", host],
++                } clientKey:key];
+                 NSLog(@"Authentication failed");
+                 callback(@[[NSString stringWithFormat:@"Authentication to host %@ failed", host]]);
+             }
+         });
+     } else {
+       if (session) {
++        [self emitTrace:@"socket-connect-failure" detail:@{
++            @"reason": [NSString stringWithFormat:@"Connection to host %@ failed, with session", host],
++            @"isConnected": @(session.isConnected),
++            @"isAuthorized": @(session.isAuthorized),
++        } clientKey:key];
+         NSLog(@"Connection to host %@ failed", host);
+         callback(@[[NSString stringWithFormat:@"Connection to host %@ failed, with session", host]]);
+       } else {
++        [self emitTrace:@"socket-connect-failure" detail:@{
++            @"reason": [NSString stringWithFormat:@"Connection to host %@ failed, without session", host],
++        } clientKey:key];
+         NSLog(@"Connection to host %@ failed", host);
+         callback(@[[NSString stringWithFormat:@"Connection to host %@ failed, without session", host]]);
+       }
+@@ -119,18 +182,40 @@ RCT_EXPORT_METHOD(startShell:(nonnull NSString*)key
+     SSHClient* client = [self clientForKey:key];
+     if (client) {
+         client.delegate = self;
+-//        NSError* error = nil;
+         __block NSError *error = nil;
+         dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
++            [self emitTrace:@"channel-create-start" detail:@{
++                @"ptyType": ptyType ?: @"vanilla",
++                @"isConnected": @(client._session.isConnected),
++                @"isAuthorized": @(client._session.isAuthorized),
++            } clientKey:key];
++
++            [self emitTrace:@"pty-request-start" detail:@{ @"ptyType": ptyType ?: @"vanilla" } clientKey:key];
++            [self emitTrace:@"shell-request-start" detail:@{ @"ptyType": ptyType ?: @"vanilla" } clientKey:key];
++
+             [client startShell:ptyType error:&error];
+             if (error) {
++                NSString *reason = [NSString stringWithFormat:@"Error starting shell: %@", error.localizedDescription ?: error];
++                [self emitTrace:@"shell-request-failure" detail:@{
++                    @"ptyType": ptyType ?: @"vanilla",
++                    @"reason": reason,
++                    @"isConnected": @(client._session.isConnected),
++                    @"isAuthorized": @(client._session.isAuthorized),
++                } clientKey:key];
+                 NSLog(@"Error starting shell: %@", error);
+                 callback(@[RCTJSErrorFromNSError(error)]);
+             } else {
++                [self emitTrace:@"shell-open-success" detail:@{
++                    @"ptyType": ptyType ?: @"vanilla",
++                    @"isConnected": @(client._session.isConnected),
++                    @"isAuthorized": @(client._session.isAuthorized),
++                } clientKey:key];
++                [self emitTrace:@"stream-open" detail:@{ @"ptyType": ptyType ?: @"vanilla" } clientKey:key];
+                 callback(@[]);
+             }
+         });
+     } else {
++        [self emitTrace:@"channel-create-failure" detail:@{ @"reason": @"Unknown client" } clientKey:key];
+         callback(@[@"Unknown client"]);
+     }
+ }
+diff --git a/node_modules/@dylankenneally/react-native-ssh-sftp/ios/RNSSHClient.xcodeproj/project.pbxproj b/node_modules/@dylankenneally/react-native-ssh-sftp/ios/RNSSHClient.xcodeproj/project.pbxproj
+old mode 100644
+new mode 100755
+diff --git a/node_modules/@dylankenneally/react-native-ssh-sftp/ios/SSHClient.h b/node_modules/@dylankenneally/react-native-ssh-sftp/ios/SSHClient.h
+old mode 100644
+new mode 100755
+diff --git a/node_modules/@dylankenneally/react-native-ssh-sftp/ios/SSHClient.m b/node_modules/@dylankenneally/react-native-ssh-sftp/ios/SSHClient.m
+old mode 100644
+new mode 100755
+index 61603e5..d8bdf9f
+--- a/node_modules/@dylankenneally/react-native-ssh-sftp/ios/SSHClient.m
++++ b/node_modules/@dylankenneally/react-native-ssh-sftp/ios/SSHClient.m
+@@ -54,7 +54,7 @@ int uploadedPerc = 0;
+     }
+ 
+     channel.ptyTerminalType = type;
+-    dispatch_async(dispatch_get_main_queue(), ^
++    dispatch_sync(dispatch_get_main_queue(), ^
+     {
+         [channel startShell:error];
+     });
+diff --git a/node_modules/@dylankenneally/react-native-ssh-sftp/lib/sshclient.d.ts b/node_modules/@dylankenneally/react-native-ssh-sftp/lib/sshclient.d.ts
+old mode 100644
+new mode 100755
+diff --git a/node_modules/@dylankenneally/react-native-ssh-sftp/lib/sshclient.d.ts.map b/node_modules/@dylankenneally/react-native-ssh-sftp/lib/sshclient.d.ts.map
+old mode 100644
+new mode 100755
+diff --git a/node_modules/@dylankenneally/react-native-ssh-sftp/lib/sshclient.js b/node_modules/@dylankenneally/react-native-ssh-sftp/lib/sshclient.js
+old mode 100644
+new mode 100755
+diff --git a/node_modules/@dylankenneally/react-native-ssh-sftp/lib/sshclient.js.map b/node_modules/@dylankenneally/react-native-ssh-sftp/lib/sshclient.js.map
+old mode 100644
+new mode 100755
