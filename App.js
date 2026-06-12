@@ -31,6 +31,29 @@ const ANTHROPIC_KEY = 'sentinel_command_anthropic_key';
 const SETTINGS_KEY = 'sentinel_command_settings';
 const SHARED_PROMPT_KEY = 'sentinel_command_shared_prompt';
 
+const safeStore = {
+  async getItemAsync(key) {
+    if (Platform.OS === 'web') {
+      return globalThis.localStorage?.getItem(key) ?? null;
+    }
+    return SecureStore.getItemAsync(key);
+  },
+  async setItemAsync(key, value) {
+    if (Platform.OS === 'web') {
+      globalThis.localStorage?.setItem(key, value);
+      return;
+    }
+    return SecureStore.setItemAsync(key, value);
+  },
+  async deleteItemAsync(key) {
+    if (Platform.OS === 'web') {
+      globalThis.localStorage?.removeItem(key);
+      return;
+    }
+    return SecureStore.deleteItemAsync(key);
+  },
+};
+
 const TABS = [
   { id: 'home', label: 'Home' },
   { id: 'invest', label: 'Invest' },
@@ -115,7 +138,7 @@ function normalizeList(payload, keys = []) {
 }
 
 async function loadSettings() {
-  const raw = await SecureStore.getItemAsync(SETTINGS_KEY);
+  const raw = await safeStore.getItemAsync(SETTINGS_KEY);
   if (!raw) return { alpacaMode: 'paper', notifications: true, legionHealthUrl: LEGION_HEALTH_DEFAULT };
   try {
     return { alpacaMode: 'paper', notifications: true, legionHealthUrl: LEGION_HEALTH_DEFAULT, ...JSON.parse(raw) };
@@ -125,7 +148,7 @@ async function loadSettings() {
 }
 
 async function saveSettings(settings) {
-  await SecureStore.setItemAsync(SETTINGS_KEY, JSON.stringify(settings));
+  await safeStore.setItemAsync(SETTINGS_KEY, JSON.stringify(settings));
 }
 
 function makeApi(token, settings) {
@@ -154,10 +177,10 @@ function makeApi(token, settings) {
 
   return {
     request,
-    login: (email, password) =>
+    login: (password) =>
       request(`${DASHBOARD_API_DEFAULT}/auth/login`, {
         method: 'POST',
-        body: JSON.stringify({ email, password }),
+        body: JSON.stringify({ password }),
       }),
     registerDevice: (expoPushToken) =>
       request(`${DASHBOARD_API_DEFAULT}/devices/register`, {
@@ -261,7 +284,6 @@ function ErrorState({ message, onRetry }) {
 }
 
 function LoginScreen({ onLogin }) {
-  const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -270,10 +292,10 @@ function LoginScreen({ onLogin }) {
     setLoading(true);
     setError('');
     try {
-      const data = await makeApi(null, { legionHealthUrl: LEGION_HEALTH_DEFAULT }).login(email.trim(), password);
+      const data = await makeApi(null, { legionHealthUrl: LEGION_HEALTH_DEFAULT }).login(password);
       const token = data?.token || data?.sessionToken || data?.access_token || data?.accessToken;
       if (!token) throw new Error('Login succeeded, but no session token was returned.');
-      await SecureStore.setItemAsync(AUTH_TOKEN_KEY, token);
+      await safeStore.setItemAsync(AUTH_TOKEN_KEY, token);
       onLogin(token);
     } catch (err) {
       setError(err.message);
@@ -288,10 +310,9 @@ function LoginScreen({ onLogin }) {
       <View style={styles.loginBox}>
         <Text style={styles.brand}>Sentinel Command</Text>
         <Text style={styles.subhead}>Secure mobile control for Sentinel Prime.</Text>
-        <Field label="Email" value={email} onChangeText={setEmail} keyboardType="email-address" placeholder="paul@example.com" />
-        <Field label="Password" value={password} onChangeText={setPassword} secureTextEntry placeholder="Password" />
+        <Field label="Master password" value={password} onChangeText={setPassword} secureTextEntry placeholder="sentinelprime2026" />
         {error ? <Text style={styles.errorText}>{error}</Text> : null}
-        <Button label={loading ? 'Authenticating...' : 'Login'} onPress={submit} disabled={loading || !email || !password} />
+        <Button label={loading ? 'Authenticating...' : 'Login'} onPress={submit} disabled={loading || !password} />
       </View>
     </KeyboardAvoidingView>
   );
@@ -651,10 +672,10 @@ function AgentsScreen({ api, openClaudeTab }) {
 
   useEffect(() => {
     const timer = setInterval(async () => {
-      const shared = await SecureStore.getItemAsync(SHARED_PROMPT_KEY);
+      const shared = await safeStore.getItemAsync(SHARED_PROMPT_KEY);
       if (shared) {
         setPrompt(shared);
-        await SecureStore.deleteItemAsync(SHARED_PROMPT_KEY);
+        await safeStore.deleteItemAsync(SHARED_PROMPT_KEY);
       }
     }, 1000);
     return () => clearInterval(timer);
@@ -758,7 +779,7 @@ function ClaudeScreen({ initialPrompt = '', onShareToAgent }) {
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
-    SecureStore.getItemAsync(ANTHROPIC_KEY).then((key) => setApiKey(key || ''));
+    safeStore.getItemAsync(ANTHROPIC_KEY).then((key) => setApiKey(key || ''));
   }, []);
 
   useEffect(() => {
@@ -850,7 +871,7 @@ function SettingsScreen({ settings, setSettings, onLogout }) {
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
-    SecureStore.getItemAsync(ANTHROPIC_KEY).then((key) => setApiKey(key || ''));
+    safeStore.getItemAsync(ANTHROPIC_KEY).then((key) => setApiKey(key || ''));
   }, []);
 
   const persistSettings = async (patch) => {
@@ -862,8 +883,8 @@ function SettingsScreen({ settings, setSettings, onLogout }) {
   const saveKey = async () => {
     setSaving(true);
     try {
-      if (apiKey.trim()) await SecureStore.setItemAsync(ANTHROPIC_KEY, apiKey.trim());
-      else await SecureStore.deleteItemAsync(ANTHROPIC_KEY);
+      if (apiKey.trim()) await safeStore.setItemAsync(ANTHROPIC_KEY, apiKey.trim());
+      else await safeStore.deleteItemAsync(ANTHROPIC_KEY);
       Alert.alert('Saved', 'Settings updated.');
     } finally {
       setSaving(false);
@@ -922,7 +943,7 @@ export default function App() {
 
   useEffect(() => {
     (async () => {
-      const [storedToken, storedSettings] = await Promise.all([SecureStore.getItemAsync(AUTH_TOKEN_KEY), loadSettings()]);
+      const [storedToken, storedSettings] = await Promise.all([safeStore.getItemAsync(AUTH_TOKEN_KEY), loadSettings()]);
       setToken(storedToken);
       setSettings(storedSettings);
       setBooting(false);
@@ -963,12 +984,12 @@ export default function App() {
   }, [api, settings.notifications, token]);
 
   const shareToAgent = async (text) => {
-    await SecureStore.setItemAsync(SHARED_PROMPT_KEY, text);
+    await safeStore.setItemAsync(SHARED_PROMPT_KEY, text);
     setTab('agents');
   };
 
   const logout = async () => {
-    await SecureStore.deleteItemAsync(AUTH_TOKEN_KEY);
+    await safeStore.deleteItemAsync(AUTH_TOKEN_KEY);
     setToken(null);
   };
 
