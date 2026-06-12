@@ -188,6 +188,7 @@ function makeApi(token, settings) {
         body: JSON.stringify({ token: expoPushToken, platform: Platform.OS }),
       }),
     legionStatus: () => request(settings.legionHealthUrl || LEGION_HEALTH_DEFAULT),
+    overview: () => request(`${DASHBOARD_API_DEFAULT}/overview`),
     wakeLegion: () => request(`${DASHBOARD_API_DEFAULT}/legion/wake`, { method: 'POST' }),
     shutdownLegion: () => request(`${DASHBOARD_API_DEFAULT}/legion/shutdown`, { method: 'POST' }),
     activeAgents: () => request(`${DASHBOARD_API_DEFAULT}/agents/active`),
@@ -330,21 +331,40 @@ function HomeScreen({ api, token, settings }) {
   const load = useCallback(async () => {
     setError('');
     try {
-      const [legionResult, agentsResult, statsResult, activityResult] = await Promise.allSettled([
+      const [legionResult, overviewResult] = await Promise.allSettled([
         api.legionStatus(),
-        api.activeAgents(),
-        api.stats(),
-        api.activity(),
+        api.overview(),
       ]);
       setLegion(
         legionResult.status === 'fulfilled'
           ? { online: true, ...(legionResult.value || {}) }
+          : overviewResult.status === 'fulfilled' && overviewResult.value?.legion
+            ? { online: Boolean(overviewResult.value.legion.ok), ...(overviewResult.value.legion || {}) }
           : { online: false, error: legionResult.reason?.message },
       );
-      setAgents(agentsResult.status === 'fulfilled' ? normalizeList(agentsResult.value, ['agents', 'jobs']) : fallbackAgents);
-      setStats(statsResult.status === 'fulfilled' ? statsResult.value || {} : {});
-      setActivity(activityResult.status === 'fulfilled' ? normalizeList(activityResult.value, ['activity', 'events']).slice(0, 10) : fallbackActivity);
-      if (legionResult.status === 'rejected') setError(legionResult.reason?.message || 'Legion status failed.');
+      setAgents(fallbackAgents);
+      setStats(
+        overviewResult.status === 'fulfilled'
+          ? {
+              productsListedToday: overviewResult.value?.activeProducts ?? 0,
+              openTrades: overviewResult.value?.subscribers ?? 0,
+              pendingSignals: (overviewResult.value?.pendingScout ?? 0) + (overviewResult.value?.pendingLister ?? 0),
+            }
+          : {},
+      );
+      setActivity(
+        overviewResult.status === 'fulfilled'
+          ? normalizeList(overviewResult.value, ['payments']).slice(0, 10).map((payment, index) => ({
+              id: payment.id || `payment-${index}`,
+              service: 'Dashboard',
+              message: payment.description || payment.customer_email || 'Recent payment',
+              time: payment.created ? new Date(payment.created * 1000).toISOString() : new Date().toISOString(),
+            }))
+          : fallbackActivity,
+      );
+      if (legionResult.status === 'rejected' && overviewResult.status === 'rejected') {
+        setError(legionResult.reason?.message || overviewResult.reason?.message || 'Overview failed.');
+      }
     } finally {
       setLoading(false);
       setRefreshing(false);
