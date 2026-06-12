@@ -1,2022 +1,1145 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  InputAccessoryView,
-  Keyboard,
+  ActivityIndicator,
+  Alert,
+  FlatList,
   KeyboardAvoidingView,
-  NativeEventEmitter,
-  NativeModules,
+  Modal,
   Platform,
   Pressable,
+  RefreshControl,
   ScrollView,
   StyleSheet,
+  Switch,
   Text,
   TextInput,
   View,
 } from 'react-native';
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import { StatusBar } from 'expo-status-bar';
-import SSHClient from '@dylankenneally/react-native-ssh-sftp';
+import * as Notifications from 'expo-notifications';
+import * as SecureStore from 'expo-secure-store';
+import * as Speech from 'expo-speech';
 
-const { RNSSHClient } = NativeModules;
+const DASHBOARD_API_DEFAULT = 'https://dashboard.sentinelprime.org/api';
+const SCOUT_URL = 'https://scout.sentinelprime.org';
+const LISTER_URL = 'https://lister.sentinelprime.org';
+const INVEST_URL = 'https://invest.sentinelprime.org';
+const LEGION_HEALTH_DEFAULT = 'http://192.168.0.117:8001/health';
+const CLAUDE_MODEL = 'claude-sonnet-4-20250514';
+const AUTH_TOKEN_KEY = 'sentinel_command_session_token';
+const ANTHROPIC_KEY = 'sentinel_command_anthropic_key';
+const SETTINGS_KEY = 'sentinel_command_settings';
+const SHARED_PROMPT_KEY = 'sentinel_command_shared_prompt';
 
-const PROMPT = 'PS > ';
-const INPUT_ACCESSORY_ID = 'forge-lite-keyboard-dismiss';
-const STORAGE_KEY = 'forge_lite_ssh_key';
-const BG = '#000000';
-const FG = '#CCCCCC';
-const MAX_HISTORY = 50;
+const TABS = [
+  { id: 'home', label: 'Home' },
+  { id: 'invest', label: 'Invest' },
+  { id: 'agents', label: 'Agents' },
+  { id: 'claude', label: 'Claude' },
+  { id: 'settings', label: 'Settings' },
+];
 
-const STARTUP_TEXT =
-  'Forge Lite v1.0\n' +
-  'Copyright (C) Sentinel Prime. All rights reserved.\n\n' +
-  'Install the latest Sentinel: https://sentinelprime.org\n\n' +
-  'Commands:\n' +
-  '  ssh user@host        Connect to a remote machine\n' +
-  '  ssh-add              Import SSH PRIVATE key (id_ed25519, NOT .pub)\n' +
-  '  ssh-keys             List stored keys\n' +
-  '  ssh-show             Preview stored private key\n' +
-  "  ssh-remove [n]       Remove a stored key\n" +
-  '  ssh-debug            Show key auth diagnostics\n' +
-  '  ssh-trace [user@host]  Trace full SSH connection lifecycle\n' +
-  '  ssh-probe host[:port]  Raw TCP + SSH banner probe\n' +
-  '  ssh-password-test user@host  Password-only transport/auth test\n\n' +
-  PROMPT;
+const SYSTEM_PROMPT =
+  "You are Claude, Paul's AI assistant for Sentinel Prime. Paul is a solo founder building an AI and security software ecosystem. Help him brainstorm, debug, write agent prompts, and make business decisions. Be direct and concise.";
 
-const MONO_FONT = Platform.select({
-  ios: 'Courier New',
-  android: 'monospace',
-  default: 'monospace',
+Notifications.setNotificationHandler({
+  handleNotification: async () => ({
+    shouldShowAlert: true,
+    shouldPlaySound: true,
+    shouldSetBadge: true,
+  }),
 });
 
-function formatKeyDate(iso) {
-  const date = new Date(iso);
-  return date.toLocaleDateString('en-US', {
-    month: 'short',
-    day: 'numeric',
-    year: 'numeric',
-  });
+const fallbackSignals = [
+  {
+    id: 'NVDA-20260611',
+    ticker: 'NVDA',
+    direction: 'LONG',
+    confidence: 86,
+    entry: 142.4,
+    target: 154,
+    stop: 136.2,
+    technicals: { rsi: 61, macd: 'Bullish crossover', volume: '+22% vs 20D' },
+    bullCase: ['AI infrastructure demand remains durable', 'Momentum reclaimed the 20-day average'],
+    bearCase: ['Valuation leaves little margin for misses', 'Semis remain sensitive to export headlines'],
+  },
+  {
+    id: 'AAPL-20260611',
+    ticker: 'AAPL',
+    direction: 'PASS',
+    confidence: 62,
+    entry: 203.1,
+    target: 209,
+    stop: 198.4,
+    technicals: { rsi: 49, macd: 'Neutral', volume: 'Flat' },
+    bullCase: ['Services growth supports margins'],
+    bearCase: ['No clean momentum confirmation yet'],
+  },
+];
+
+const fallbackActivity = [
+  { id: 'act-1', service: 'Invest', message: 'Signal scan completed', time: new Date().toISOString() },
+  { id: 'act-2', service: 'Legion', message: 'Health check queued', time: new Date().toISOString() },
+];
+
+const fallbackAgents = [
+  { id: 'agent-1', name: 'Codex', repo: 'sentinel-command', status: 'idle', startedAt: new Date().toISOString() },
+];
+
+function compactTime(value) {
+  if (!value) return 'Unknown';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  return date.toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
 }
 
-async function loadStoredKey() {
-  const raw = await AsyncStorage.getItem(STORAGE_KEY);
-  if (!raw) return null;
+function money(value) {
+  if (value === undefined || value === null || value === '') return '-';
+  const num = Number(value);
+  if (Number.isNaN(num)) return String(value);
+  return num.toLocaleString('en-US', { style: 'currency', currency: 'USD' });
+}
+
+function pct(value) {
+  const num = Number(value);
+  if (Number.isNaN(num)) return '-';
+  return `${Math.round(num)}%`;
+}
+
+function normalizeList(payload, keys = []) {
+  if (Array.isArray(payload)) return payload;
+  for (const key of keys) {
+    if (Array.isArray(payload?.[key])) return payload[key];
+  }
+  return [];
+}
+
+async function loadSettings() {
+  const raw = await SecureStore.getItemAsync(SETTINGS_KEY);
+  if (!raw) return { alpacaMode: 'paper', notifications: true, legionHealthUrl: LEGION_HEALTH_DEFAULT };
   try {
-    const parsed = JSON.parse(raw);
-    if (parsed?.key) return parsed;
-    return null;
+    return { alpacaMode: 'paper', notifications: true, legionHealthUrl: LEGION_HEALTH_DEFAULT, ...JSON.parse(raw) };
   } catch {
-    return null;
+    return { alpacaMode: 'paper', notifications: true, legionHealthUrl: LEGION_HEALTH_DEFAULT };
   }
 }
 
-async function saveStoredKey(keyMaterial, publicKey = null) {
-  await AsyncStorage.setItem(
-    STORAGE_KEY,
-    JSON.stringify({
-      key: keyMaterial,
-      publicKey,
-      addedAt: new Date().toISOString(),
-    }),
-  );
+async function saveSettings(settings) {
+  await SecureStore.setItemAsync(SETTINGS_KEY, JSON.stringify(settings));
 }
 
-async function clearStoredKey() {
-  await AsyncStorage.removeItem(STORAGE_KEY);
-}
-
-function parseSshCommand(line) {
-  const trimmed = line.trim();
-  if (!trimmed.toLowerCase().startsWith('ssh ')) {
-    return { type: 'not_ssh' };
-  }
-
-  const tokens = trimmed.split(/\s+/).slice(1);
-  let port = 22;
-  const parts = [];
-
-  for (let i = 0; i < tokens.length; i += 1) {
-    if (tokens[i] === '-p' && tokens[i + 1]) {
-      port = parseInt(tokens[i + 1], 10) || 22;
-      i += 1;
-      continue;
-    }
-    parts.push(tokens[i]);
-  }
-
-  if (parts.length !== 1) {
-    return { type: 'invalid' };
-  }
-
-  if (!parts[0].includes('@')) {
-    return { type: 'missing_username' };
-  }
-
-  const at = parts[0].indexOf('@');
-  const username = parts[0].slice(0, at);
-  const host = parts[0].slice(at + 1);
-
-  if (!username || !host) {
-    return { type: 'missing_username' };
-  }
-
-  return { type: 'ok', username, host, port };
-}
-
-function normalizeNewlines(key) {
-  return key.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim();
-}
-
-function stripPemHeaders(key, label) {
-  const begin = `-----BEGIN ${label}-----`;
-  const end = `-----END ${label}-----`;
-  return key.replace(begin, '').replace(end, '').trim();
-}
-
-function isRsaAsn1Body(body) {
-  const cleaned = body.replace(/\s/g, '');
-  return cleaned.startsWith('MII') && /^[A-Za-z0-9+/=\s]+$/.test(cleaned);
-}
-
-function isOpensshKeyBody(body) {
-  const cleaned = body.replace(/\s/g, '');
-  if (cleaned.startsWith('b3BlbnNzaC1rZXk')) {
-    return true;
-  }
-
-  try {
-    if (typeof globalThis.atob === 'function') {
-      const decoded = globalThis.atob(cleaned.slice(0, 24));
-      return decoded.startsWith('openssh-key-v1');
-    }
-  } catch {
-    return false;
-  }
-
-  return false;
-}
-
-function repairMangledKey(key) {
-  if (!key.includes('-----BEGIN OPENSSH PRIVATE KEY-----')) {
-    return key;
-  }
-
-  const body = stripPemHeaders(key, 'OPENSSH PRIVATE KEY');
-  if (!isRsaAsn1Body(body)) {
-    return key;
-  }
-
-  console.warn('[ForgeLite wrapKey] repairing mangled key: RSA body inside OpenSSH headers');
-  return `-----BEGIN RSA PRIVATE KEY-----\n${body}\n-----END RSA PRIVATE KEY-----`;
-}
-
-function detectKeyType(privateKey) {
-  if (privateKey.includes('OPENSSH PRIVATE KEY')) return 'openssh';
-  if (privateKey.includes('RSA PRIVATE KEY')) return 'rsa-pem';
-  if (privateKey.includes('EC PRIVATE KEY')) return 'ecdsa-pem';
-  if (privateKey.includes('DSA PRIVATE KEY')) return 'dsa-pem';
-  if (privateKey.includes('ENCRYPTED PRIVATE KEY')) return 'pkcs8-encrypted';
-  if (isRsaAsn1Body(privateKey)) return 'rsa-pem-body';
-  if (isOpensshKeyBody(privateKey)) return 'openssh-body';
-  return 'unknown';
-}
-
-function wrapKey(raw) {
-  let key = normalizeNewlines(raw);
-  if (!key) {
-    console.log('[ForgeLite wrapKey] empty input');
-    return '';
-  }
-
-  key = repairMangledKey(key);
-
-  const inputType = detectKeyType(key);
-  const inputFirstLine = key.split('\n')[0];
-  let wrapped = false;
-
-  console.log('[ForgeLite wrapKey] input', {
-    detectedType: inputType,
-    firstLine: inputFirstLine,
-  });
-
-  if (key.includes('-----BEGIN RSA PRIVATE KEY-----')) {
-    const result = key;
-    console.log('[ForgeLite wrapKey] result', {
-      detectedType: 'rsa-pem',
-      conversion: false,
-      finalFirstLine: result.split('\n')[0],
-    });
-    return result;
-  }
-
-  if (key.includes('-----BEGIN OPENSSH PRIVATE KEY-----')) {
-    const result = key;
-    console.log('[ForgeLite wrapKey] result', {
-      detectedType: 'openssh',
-      conversion: false,
-      finalFirstLine: result.split('\n')[0],
-    });
-    return result;
-  }
-
-  if (key.includes('-----BEGIN EC PRIVATE KEY-----')) {
-    const result = key;
-    console.log('[ForgeLite wrapKey] result', {
-      detectedType: 'ecdsa-pem',
-      conversion: false,
-      finalFirstLine: result.split('\n')[0],
-    });
-    return result;
-  }
-
-  if (key.includes('-----BEGIN DSA PRIVATE KEY-----')) {
-    const result = key;
-    console.log('[ForgeLite wrapKey] result', {
-      detectedType: 'dsa-pem',
-      conversion: false,
-      finalFirstLine: result.split('\n')[0],
-    });
-    return result;
-  }
-
-  if (key.includes('-----BEGIN ENCRYPTED PRIVATE KEY-----')) {
-    const result = key;
-    console.log('[ForgeLite wrapKey] result', {
-      detectedType: 'pkcs8-encrypted',
-      conversion: false,
-      finalFirstLine: result.split('\n')[0],
-    });
-    return result;
-  }
-
-  if (/-----BEGIN [^-]+-----/.test(key)) {
-    const result = key;
-    console.log('[ForgeLite wrapKey] result', {
-      detectedType: inputType,
-      conversion: false,
-      finalFirstLine: result.split('\n')[0],
-    });
-    return result;
-  }
-
-  const body = key.replace(/\s/g, '');
-
-  if (isRsaAsn1Body(body)) {
-    wrapped = true;
-    key = `-----BEGIN RSA PRIVATE KEY-----\n${key}\n-----END RSA PRIVATE KEY-----`;
-    console.log('[ForgeLite wrapKey] result', {
-      detectedType: 'rsa-pem',
-      conversion: true,
-      wrapping: 'rsa-pem-headers-added',
-      finalFirstLine: key.split('\n')[0],
-    });
-    return key;
-  }
-
-  if (isOpensshKeyBody(body)) {
-    wrapped = true;
-    key = `-----BEGIN OPENSSH PRIVATE KEY-----\n${key}\n-----END OPENSSH PRIVATE KEY-----`;
-    console.log('[ForgeLite wrapKey] result', {
-      detectedType: 'openssh',
-      conversion: true,
-      wrapping: 'openssh-headers-added',
-      finalFirstLine: key.split('\n')[0],
-    });
-    return key;
-  }
-
-  wrapped = true;
-  key = `-----BEGIN OPENSSH PRIVATE KEY-----\n${key}\n-----END OPENSSH PRIVATE KEY-----`;
-  console.log('[ForgeLite wrapKey] result', {
-    detectedType: inputType,
-    conversion: wrapped,
-    wrapping: 'openssh-headers-added-default',
-    finalFirstLine: key.split('\n')[0],
-  });
-  return key;
-}
-
-function decodeBase64(str) {
-  const cleaned = str.replace(/\s/g, '');
-  if (typeof globalThis.atob === 'function') {
-    const binary = globalThis.atob(cleaned);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i += 1) {
-      bytes[i] = binary.charCodeAt(i);
-    }
-    return bytes;
-  }
-  throw new Error('Base64 decode unavailable in this runtime');
-}
-
-function readSshString(bytes, offset) {
-  const view = new DataView(bytes.buffer, bytes.byteOffset + offset, 4);
-  const length = view.getUint32(0);
-  const start = offset + 4;
-  const value = bytes.slice(start, start + length);
-  return { value, next: start + length };
-}
-
-function encodeSshPublicLine(keyType, keyBytes) {
-  const typeBytes = new TextEncoder().encode(keyType);
-  const wire = new Uint8Array(4 + typeBytes.length + 4 + keyBytes.length);
-  const view = new DataView(wire.buffer);
-  let offset = 0;
-  view.setUint32(offset, typeBytes.length);
-  offset += 4;
-  wire.set(typeBytes, offset);
-  offset += typeBytes.length;
-  view.setUint32(offset, keyBytes.length);
-  offset += 4;
-  wire.set(keyBytes, offset);
-
-  let binary = '';
-  for (let i = 0; i < wire.length; i += 1) {
-    binary += String.fromCharCode(wire[i]);
-  }
-  const encoded = globalThis.btoa(binary);
-  return `${keyType} ${encoded}`;
-}
-
-function concatUint8Arrays(arrays) {
-  const totalLength = arrays.reduce((sum, part) => sum + part.length, 0);
-  const combined = new Uint8Array(totalLength);
-  let offset = 0;
-  for (const part of arrays) {
-    combined.set(part, offset);
-    offset += part.length;
-  }
-  return combined;
-}
-
-function encodeSshStringBytes(value) {
-  const bytes = typeof value === 'string' ? new TextEncoder().encode(value) : value;
-  const out = new Uint8Array(4 + bytes.length);
-  new DataView(out.buffer).setUint32(0, bytes.length);
-  out.set(bytes, 4);
-  return out;
-}
-
-function encodeMpint(integerBytes) {
-  let bytes = integerBytes instanceof Uint8Array ? integerBytes : new Uint8Array(integerBytes);
-  let start = 0;
-
-  while (start < bytes.length - 1 && bytes[start] === 0 && (bytes[start + 1] & 0x80) === 0) {
-    start += 1;
-  }
-
-  bytes = bytes.slice(start);
-
-  if (bytes.length > 0 && (bytes[0] & 0x80) !== 0) {
-    const padded = new Uint8Array(bytes.length + 1);
-    padded[0] = 0;
-    padded.set(bytes, 1);
-    bytes = padded;
-  }
-
-  const out = new Uint8Array(4 + bytes.length);
-  new DataView(out.buffer).setUint32(0, bytes.length);
-  out.set(bytes, 4);
-  return out;
-}
-
-function encodeSshRsaPublicKey(modulusBytes, exponentBytes) {
-  const wire = concatUint8Arrays([
-    encodeSshStringBytes('ssh-rsa'),
-    encodeMpint(exponentBytes),
-    encodeMpint(modulusBytes),
-  ]);
-
-  let binary = '';
-  for (let i = 0; i < wire.length; i += 1) {
-    binary += String.fromCharCode(wire[i]);
-  }
-
-  return `ssh-rsa ${globalThis.btoa(binary)}`;
-}
-
-function readAsn1Length(bytes, offset) {
-  const first = bytes[offset];
-  if (first < 0x80) {
-    return { length: first, next: offset + 1 };
-  }
-
-  const numBytes = first & 0x7f;
-  let length = 0;
-  for (let i = 0; i < numBytes; i += 1) {
-    length = (length << 8) | bytes[offset + 1 + i];
-  }
-
-  return { length, next: offset + 1 + numBytes };
-}
-
-function readAsn1Integer(bytes, offset) {
-  if (bytes[offset] !== 0x02) {
-    throw new Error('Expected ASN.1 INTEGER');
-  }
-
-  const lengthInfo = readAsn1Length(bytes, offset + 1);
-  const start = lengthInfo.next;
-  return {
-    value: bytes.slice(start, start + lengthInfo.length),
-    next: start + lengthInfo.length,
-  };
-}
-
-function readAsn1Sequence(bytes, offset) {
-  if (bytes[offset] !== 0x30) {
-    throw new Error('Expected ASN.1 SEQUENCE');
-  }
-
-  const lengthInfo = readAsn1Length(bytes, offset + 1);
-  const start = lengthInfo.next;
-  return {
-    contents: bytes.slice(start, start + lengthInfo.length),
-    next: start + lengthInfo.length,
-  };
-}
-
-function parsePkcs1RsaPrivateKey(derBytes) {
-  const sequence = readAsn1Sequence(derBytes, 0);
-  let offset = 0;
-
-  const version = readAsn1Integer(sequence.contents, offset);
-  offset = version.next;
-
-  const modulus = readAsn1Integer(sequence.contents, offset);
-  offset = modulus.next;
-
-  const publicExponent = readAsn1Integer(sequence.contents, offset);
-
-  return {
-    modulus: modulus.value,
-    publicExponent: publicExponent.value,
-  };
-}
-
-function getRsaPemBody(privateKey) {
-  return privateKey
-    .replace(/-----BEGIN RSA PRIVATE KEY-----/g, '')
-    .replace(/-----END RSA PRIVATE KEY-----/g, '')
-    .replace(/\s/g, '');
-}
-
-function deriveRsaPublicKey(privateKey) {
-  const keyType = detectKeyType(privateKey);
-  if (keyType !== 'rsa-pem' && keyType !== 'rsa-pem-body') {
-    throw new Error(`deriveRsaPublicKey requires RSA PEM key, got ${keyType}`);
-  }
-
-  try {
-    const derBytes = decodeBase64(getRsaPemBody(privateKey));
-    const { modulus, publicExponent } = parsePkcs1RsaPrivateKey(derBytes);
-    const publicKey = encodeSshRsaPublicKey(modulus, publicExponent);
-    const fingerprintPreview = `${publicKey.split(/\s+/)[1]?.slice(0, 24) || ''}...`;
-
-    console.log('[ForgeLite RSA] public key derivation success', {
-      algorithm: 'ssh-rsa',
-      derivedKeyLength: publicKey.length,
-      fingerprintPreview,
-      modulusBytes: modulus.length,
-      exponentBytes: publicExponent.length,
-    });
-
-    return publicKey;
-  } catch (error) {
-    console.error('[ForgeLite RSA] public key derivation failure', {
-      error: formatAuthError(error),
-      keyType,
-    });
-    throw error;
-  }
-}
-
-function extractPublicKeyFromOpenSSH(privateKey) {
-  const body = privateKey
-    .replace(/-----BEGIN [^-]+-----/g, '')
-    .replace(/-----END [^-]+-----/g, '')
-    .replace(/\s/g, '');
-  const data = decodeBase64(body);
-  const magic = new TextDecoder().decode(data.slice(0, 15));
-  if (!magic.startsWith('openssh-key-v1')) {
-    throw new Error('Not an OpenSSH private key (openssh-key-v1)');
-  }
-
-  let offset = 15;
-  let part = readSshString(data, offset);
-  offset = part.next;
-  part = readSshString(data, offset);
-  offset = part.next;
-  part = readSshString(data, offset);
-  offset = part.next;
-
-  const view = new DataView(data.buffer, data.byteOffset + offset, 4);
-  const keyCount = view.getUint32(0);
-  offset += 4;
-  if (keyCount < 1) {
-    throw new Error('OpenSSH key blob contains no public keys');
-  }
-
-  part = readSshString(data, offset);
-  offset = part.next;
-  const publicSection = part.value;
-
-  let sectionOffset = 0;
-  part = readSshString(publicSection, sectionOffset);
-  const keyType = new TextDecoder().decode(part.value);
-  sectionOffset = part.next;
-  part = readSshString(publicSection, sectionOffset);
-  const publicKeyBytes = part.value;
-
-  return encodeSshPublicLine(keyType, publicKeyBytes);
-}
-
-function extractPublicKeyFromPrivateKey(privateKey) {
-  const keyType = detectKeyType(privateKey);
-
-  if (keyType === 'openssh' || keyType === 'openssh-body') {
-    return {
-      publicKey: extractPublicKeyFromOpenSSH(privateKey),
-      source: 'derived-openssh',
-    };
-  }
-
-  if (keyType === 'rsa-pem' || keyType === 'rsa-pem-body') {
-    return {
-      publicKey: deriveRsaPublicKey(privateKey),
-      source: 'derived-rsa',
-    };
-  }
-
-  return null;
-}
-
-function getPublicKeyAlgorithm(publicKey) {
-  if (!publicKey) return '(none)';
-  return publicKey.split(/\s+/)[0] || '(unknown)';
-}
-
-function formatAuthError(error) {
-  if (error == null) return 'Unknown error';
-  if (typeof error === 'string') return error;
-  if (typeof error?.message === 'string' && error.message) return error.message;
-  try {
-    return JSON.stringify(error);
-  } catch {
-    return String(error);
-  }
-}
-
-function classifyAuthFailure(message, failedStage = null) {
-  if (failedStage) {
-    return failedStage;
-  }
-
-  const lower = message.toLowerCase();
-  if (
-    lower.includes('authentication') ||
-    lower.includes('auth failed') ||
-    lower.includes('not authorized')
-  ) {
-    return 'AUTH_FAILURE';
-  }
-  if (lower.includes('permission denied')) {
-    return 'AUTH_FAILURE';
-  }
-  if (
-    lower.includes('starting shell') ||
-    lower.includes('shell') ||
-    lower.includes('pty')
-  ) {
-    if (lower.includes('pty')) return 'PTY_FAILURE';
-    return 'SHELL_FAILURE';
-  }
-  if (lower.includes('channel') || lower.includes('unknown client')) {
-    return 'CHANNEL_FAILURE';
-  }
-  if (
-    lower.includes('session not connected') ||
-    lower.includes('disconnect') ||
-    lower.includes('broken pipe')
-  ) {
-    return 'SOCKET_DISCONNECT';
-  }
-  if (
-    lower.includes('parse') ||
-    lower.includes('invalid key') ||
-    lower.includes('not an openssh') ||
-    lower.includes('base64') ||
-    lower.includes('decode')
-  ) {
-    return 'CLIENT_PARSE_FAILURE';
-  }
-  if (lower.includes('connect') || lower.includes('timeout') || lower.includes('network')) {
-    return 'CONNECTION_FAILURE';
-  }
-  return 'UNKNOWN_FAILURE';
-}
-
-function classifyFailureFromStage(stage, error) {
-  const message = formatAuthError(error);
-  const lower = `${stage} ${message}`.toLowerCase();
-
-  if (stage.includes('auth') || lower.includes('authentication')) {
-    return 'AUTH_FAILURE';
-  }
-  if (stage.includes('pty')) {
-    return 'PTY_FAILURE';
-  }
-  if (stage.includes('shell')) {
-    return 'SHELL_FAILURE';
-  }
-  if (stage.includes('channel') || stage.includes('exec')) {
-    return 'CHANNEL_FAILURE';
-  }
-  if (stage.includes('socket') || stage.includes('handshake')) {
-    return 'CONNECTION_FAILURE';
-  }
-  if (stage.includes('disconnect')) {
-    return 'SOCKET_DISCONNECT';
-  }
-
-  return classifyAuthFailure(message);
-}
-
-function createTraceTimeline() {
-  const startedAt = Date.now();
-  const events = [];
-  const timeline = {
-    events,
-    failureStage: null,
-    failureMessage: null,
-    mark(stage, detail = {}, error = null) {
-      const entry = {
-        atMs: Date.now() - startedAt,
-        stage,
-        detail,
-        error: error ? formatAuthError(error) : null,
-        source: 'js',
-      };
-      events.push(entry);
-      console.log(`[ForgeLite SSH-TRACE] +${entry.atMs}ms ${stage}`, detail, entry.error || '');
-      return entry;
-    },
-    markNative(event) {
-      const entry = {
-        atMs: Date.now() - startedAt,
-        stage: event.stage || 'native-event',
-        detail: event,
-        error: event.reason || null,
-        source: 'native',
-      };
-      events.push(entry);
-      console.log(`[ForgeLite SSH-TRACE] +${entry.atMs}ms native:${entry.stage}`, event);
-      return entry;
-    },
-    setFailure(stage, error) {
-      timeline.failureStage = stage;
-      timeline.failureMessage = formatAuthError(error);
-    },
-    getSummary() {
-      if (timeline.failureStage) {
-        return `${timeline.failureStage}: ${timeline.failureMessage || 'unknown error'}`;
-      }
-      return 'success';
-    },
-    formatTimeline() {
-      return events
-        .map((entry) => {
-          const detailText = entry.detail
-            ? ` ${JSON.stringify(entry.detail)}`
-            : '';
-          const errorText = entry.error ? ` ERROR=${entry.error}` : '';
-          return `[+${entry.atMs}ms] ${entry.source}:${entry.stage}${detailText}${errorText}`;
-        })
-        .join('\n');
-    },
+function makeApi(token, settings) {
+  const headers = {
+    Accept: 'application/json',
+    'Content-Type': 'application/json',
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
   };
 
-  return timeline;
-}
-
-function attachNativeTraceListener(trace, clientKey) {
-  if (Platform.OS !== 'ios' || !RNSSHClient) {
-    return null;
-  }
-
-  const emitter = new NativeEventEmitter(RNSSHClient);
-  return emitter.addListener('SshTrace', (event) => {
-    if (clientKey && event.clientKey && event.clientKey !== clientKey) {
-      return;
-    }
-    trace.markNative(event);
-  });
-}
-
-function getNativeSessionStatus(clientKey) {
-  return new Promise((resolve) => {
-    if (!RNSSHClient?.getSessionStatus) {
-      resolve({ available: false });
-      return;
-    }
-
-    RNSSHClient.getSessionStatus(clientKey, (error, status) => {
-      if (error) {
-        resolve({
-          available: true,
-          error: formatAuthError(error),
-          isConnected: false,
-          isAuthorized: false,
-        });
-        return;
-      }
-
-      resolve({
-        available: true,
-        isConnected: Boolean(status?.isConnected),
-        isAuthorized: Boolean(status?.isAuthorized),
-        hasSession: Boolean(status?.hasSession),
-      });
-    });
-  });
-}
-
-function buildKeyPair(authPrep, passphrase = '') {
-  const keyPair = {
-    privateKey: authPrep.privateKey,
-    passphrase,
-  };
-
-  if (authPrep.publicKey) {
-    keyPair.publicKey = authPrep.publicKey;
-  }
-
-  return keyPair;
-}
-
-async function runTracedConnection(target, authPrep, options = {}) {
-  const trace = createTraceTimeline();
-  let nativeUnsubscribe = attachNativeTraceListener(trace, null);
-  let client = null;
-
-  const cleanup = () => {
-    if (nativeUnsubscribe) {
-      nativeUnsubscribe.remove();
-      nativeUnsubscribe = null;
-    }
-  };
-
-  try {
-    trace.mark('socket-connect-start', {
-      host: target.host,
-      port: target.port,
-      username: target.username,
-    });
-
-    client = await connectWithKeyPair(
-      target.host,
-      target.port,
-      target.username,
-      buildKeyPair(authPrep, options.passphrase || ''),
-    );
-
-    const clientKey = client._key;
-    cleanup();
-    nativeUnsubscribe = attachNativeTraceListener(trace, clientKey);
-
-    trace.mark('handshake-complete', {
-      note: 'Native connect callback succeeded',
-    });
-    trace.mark('auth-complete', {
-      note: 'Native layer returned success; NMSSH session.isAuthorized expected true',
-    });
-
-    const sessionStatus = await getNativeSessionStatus(clientKey);
-    trace.mark('session-status', sessionStatus);
-
-    trace.mark('channel-exec-start', { command: 'echo FORGE_TRACE' });
-    try {
-      const execOutput = await client.execute('echo FORGE_TRACE');
-      trace.mark('channel-exec-success', {
-        output: String(execOutput || '').trim().slice(0, 120),
-      });
-    } catch (execError) {
-      trace.mark('channel-exec-failure', {}, execError);
-      trace.setFailure('CHANNEL_FAILURE', execError);
-      throw execError;
-    }
-
-    if (!options.skipShell) {
-      const ptyType = options.ptyType || 'vanilla';
-      trace.mark('pty-request-start', { ptyType });
-      trace.mark('shell-request-start', { ptyType });
-
+  async function request(url, options = {}) {
+    const res = await fetch(url, { ...options, headers: { ...headers, ...(options.headers || {}) } });
+    const text = await res.text();
+    let data = null;
+    if (text) {
       try {
-        await client.startShell(ptyType);
-        trace.mark('shell-open-success', { ptyType });
-        trace.mark('stream-open', { ptyType });
-      } catch (shellError) {
-        trace.mark('shell-request-failure', { ptyType }, shellError);
-        trace.setFailure(classifyFailureFromStage('shell-request-failure', shellError), shellError);
-        throw shellError;
-      }
-    }
-
-    return { trace, client, success: true };
-  } catch (error) {
-    trace.mark('disconnect-reason', {
-      stage: trace.failureStage || classifyFailureFromStage('connection', error),
-    }, error);
-
-    if (!trace.failureStage) {
-      trace.setFailure(classifyFailureFromStage('connection', error), error);
-    }
-
-    return { trace, client, success: false, error };
-  } finally {
-    cleanup();
-  }
-}
-
-function parseSshTraceCommand(line) {
-  const trimmed = line.trim();
-  if (trimmed.toLowerCase() === 'ssh-trace') {
-    return { type: 'use_last' };
-  }
-
-  if (trimmed.toLowerCase().startsWith('ssh-trace ')) {
-    return parseSshCommand(`ssh ${trimmed.slice('ssh-trace '.length)}`);
-  }
-
-  return { type: 'invalid' };
-}
-
-function parseSshProbeCommand(line) {
-  const trimmed = line.trim();
-  if (!trimmed.toLowerCase().startsWith('ssh-probe ')) {
-    return { type: 'invalid' };
-  }
-
-  const arg = trimmed.slice('ssh-probe '.length).trim();
-  if (!arg) {
-    return { type: 'invalid' };
-  }
-
-  let host = arg;
-  let port = 22;
-
-  if (arg.includes(':')) {
-    const parts = arg.split(':');
-    host = parts[0];
-    port = parseInt(parts[1], 10) || 22;
-  }
-
-  if (!host) {
-    return { type: 'invalid' };
-  }
-
-  return { type: 'ok', host, port };
-}
-
-function parseSshPasswordTestCommand(line) {
-  const trimmed = line.trim();
-  if (!trimmed.toLowerCase().startsWith('ssh-password-test ')) {
-    return { type: 'invalid' };
-  }
-
-  return parseSshCommand(`ssh ${trimmed.slice('ssh-password-test '.length)}`);
-}
-
-function probeSshHost(host, port, timeoutMs = 8000) {
-  return new Promise((resolve, reject) => {
-    if (!RNSSHClient?.probeSshHost) {
-      reject(new Error('ssh-probe unavailable on this platform (requires iOS native build)'));
-      return;
-    }
-
-    RNSSHClient.probeSshHost(host, port, timeoutMs, (error, result) => {
-      if (error) {
-        reject(error);
-        return;
-      }
-      resolve(result);
-    });
-  });
-}
-
-async function runTracedPasswordConnection(target, password, options = {}) {
-  const trace = createTraceTimeline();
-  let nativeUnsubscribe = attachNativeTraceListener(trace, null);
-  let client = null;
-
-  const cleanup = () => {
-    if (nativeUnsubscribe) {
-      nativeUnsubscribe.remove();
-      nativeUnsubscribe = null;
-    }
-  };
-
-  try {
-    trace.mark('socket-connect-start', {
-      host: target.host,
-      port: target.port,
-      username: target.username,
-      authMethod: 'password-only-test',
-    });
-    trace.mark('transport-kex-start', {
-      note: 'Password-only NMSSH connect (no key auth)',
-    });
-
-    client = await new Promise((resolve, reject) => {
-      const instance = new SSHClient(
-        target.host,
-        target.port,
-        target.username,
-        password,
-        (error) => {
-          if (error) {
-            reject(error);
-            return;
-          }
-          resolve(instance);
-        },
-      );
-    });
-
-    const clientKey = client._key;
-    cleanup();
-    nativeUnsubscribe = attachNativeTraceListener(trace, clientKey);
-
-    trace.mark('handshake-complete', {
-      note: 'Native password connect callback succeeded',
-    });
-    trace.mark('auth-complete', {
-      note: 'NMSSH session.isAuthorized expected true for password test',
-    });
-
-    const sessionStatus = await getNativeSessionStatus(clientKey);
-    trace.mark('session-status', sessionStatus);
-
-    if (!sessionStatus.isConnected) {
-      const transportError = new Error('Password test failed before transport: isConnected=false');
-      trace.setFailure('CONNECTION_FAILURE', transportError);
-      throw transportError;
-    }
-
-    if (!sessionStatus.isAuthorized) {
-      const authError = new Error('Password test failed at auth: isAuthorized=false');
-      trace.setFailure('AUTH_FAILURE', authError);
-      throw authError;
-    }
-
-    if (!options.skipShell) {
-      const ptyType = options.ptyType || 'vanilla';
-      trace.mark('pty-request-start', { ptyType });
-      trace.mark('shell-request-start', { ptyType });
-      await client.startShell(ptyType);
-      trace.mark('shell-open-success', { ptyType });
-      trace.mark('stream-open', { ptyType });
-    }
-
-    return { trace, client, success: true };
-  } catch (error) {
-    trace.mark('disconnect-reason', {
-      stage: trace.failureStage || classifyFailureFromStage('connection', error),
-    }, error);
-
-    if (!trace.failureStage) {
-      trace.setFailure(classifyFailureFromStage('connection', error), error);
-    }
-
-    return { trace, client, success: false, error };
-  } finally {
-    cleanup();
-  }
-}
-
-function diagnoseStoredKey(privateKey, publicKey, publicKeySource = 'none') {
-  const lines = privateKey.split('\n');
-  return {
-    firstLine: lines[0] || '(empty)',
-    lastLine: lines[lines.length - 1] || '(empty)',
-    totalLength: privateKey.length,
-    lineCount: lines.length,
-    hasLiteralBackslashN: privateKey.includes('\\n'),
-    hasCrlf: privateKey.includes('\r'),
-    keyType: detectKeyType(privateKey),
-    publicKeyExtracted: Boolean(publicKey),
-    publicKeySource,
-    publicKeyAlgorithm: getPublicKeyAlgorithm(publicKey),
-    derivedKeyLength: publicKey ? publicKey.length : 0,
-    publicKeyPassedToClient: Boolean(publicKey),
-    publicKeyPreview: publicKey
-      ? `${publicKey.split(/\s+/)[0]} ${(publicKey.split(/\s+/)[1] || '').slice(0, 24)}...`
-      : '(none)',
-  };
-}
-
-function connectWithKeyPair(host, port, username, keyPair) {
-  return new Promise((resolve, reject) => {
-    const client = new SSHClient(host, port, username, keyPair, (error) => {
-      if (error) {
-        reject(error);
-        return;
-      }
-      resolve(client);
-    });
-  });
-}
-
-async function prepareKeyAuth(stored) {
-  const privateKey = wrapKey(stored.key);
-
-  if (privateKey !== stored.key) {
-    await saveStoredKey(privateKey, stored.publicKey);
-  }
-
-  let publicKey = stored.publicKey || null;
-  let publicKeySource = stored.publicKey ? 'stored' : 'none';
-
-  if (!publicKey) {
-    try {
-      const extracted = extractPublicKeyFromPrivateKey(privateKey);
-      if (extracted?.publicKey) {
-        publicKey = extracted.publicKey;
-        publicKeySource = extracted.source;
-      }
-    } catch (error) {
-      return {
-        privateKey,
-        publicKey: null,
-        publicKeySource: 'extraction-failed',
-        keyType: detectKeyType(privateKey),
-        extractionError: formatAuthError(error),
-        diagnostics: diagnoseStoredKey(privateKey, null, 'extraction-failed'),
-      };
-    }
-  }
-
-  if (publicKey && publicKeySource.startsWith('derived')) {
-    await saveStoredKey(privateKey, publicKey);
-  }
-
-  let nativeKeyDetails = null;
-  try {
-    nativeKeyDetails = await SSHClient.getKeyDetails(privateKey);
-  } catch (error) {
-    nativeKeyDetails = { error: formatAuthError(error) };
-  }
-
-  return {
-    privateKey,
-    publicKey,
-    publicKeySource,
-    keyType: detectKeyType(privateKey),
-    nativeKeyDetails,
-    diagnostics: diagnoseStoredKey(privateKey, publicKey, publicKeySource),
-  };
-}
-
-function isPublicKeyContent(keyContent) {
-  if (/-----BEGIN.*PRIVATE KEY-----/.test(keyContent)) {
-    return false;
-  }
-
-  return (
-    keyContent.includes('ssh-ed25519') ||
-    keyContent.includes('ssh-rsa') ||
-    keyContent.includes('ssh-ecdsa')
-  );
-}
-
-function parseRemoveIndex(line) {
-  const match = line.trim().match(/^ssh-remove(?:\s+(\d+))?$/i);
-  if (!match) return null;
-  return match[1] ? parseInt(match[1], 10) : null;
-}
-
-export default function App() {
-  const scrollRef = useRef(null);
-  const inputRef = useRef(null);
-  const sshClientRef = useRef(null);
-  const historyRef = useRef([]);
-  const keyPasteLinesRef = useRef([]);
-  const lastAuthDebugRef = useRef(null);
-  const lastSshTargetRef = useRef(null);
-  const lastTraceRef = useRef(null);
-
-  const [mode, setMode] = useState('local');
-  const [output, setOutput] = useState(STARTUP_TEXT);
-  const [input, setInput] = useState('');
-  const [pending, setPending] = useState(null);
-  const [cursorVisible, setCursorVisible] = useState(true);
-
-  useEffect(() => {
-    const timer = setInterval(() => {
-      setCursorVisible((visible) => !visible);
-    }, 530);
-    return () => clearInterval(timer);
-  }, []);
-
-  useEffect(() => {
-    scrollRef.current?.scrollToEnd({ animated: true });
-  }, [output, input, mode]);
-
-  const appendOutput = useCallback((chunk) => {
-    if (!chunk) return;
-    setOutput((prev) => prev + chunk);
-  }, []);
-
-  const writeToShell = useCallback((text) => {
-    const client = sshClientRef.current;
-    if (!client) return;
-    client.writeToShell(text).catch((error) => {
-      appendOutput(`\n${error}`);
-    });
-  }, [appendOutput]);
-
-  const pushHistory = useCallback((line) => {
-    const trimmed = line.trim();
-    if (!trimmed) return;
-    const next = historyRef.current.filter((entry) => entry !== trimmed);
-    next.push(trimmed);
-    if (next.length > MAX_HISTORY) {
-      next.shift();
-    }
-    historyRef.current = next;
-  }, []);
-
-  const disconnect = useCallback(() => {
-    const client = sshClientRef.current;
-    if (client) {
-      try {
-        client.closeShell();
+        data = JSON.parse(text);
       } catch {
-        /* ignore */
-      }
-      try {
-        client.disconnect();
-      } catch {
-        /* ignore */
+        data = { text };
       }
     }
-    sshClientRef.current = null;
-    setMode('local');
-    setPending(null);
-    setInput('');
-  }, []);
-
-  const establishShell = useCallback(
-    async (client) => {
-      client.on('Shell', (data) => {
-        if (data) appendOutput(data);
-      });
-      await client.startShell('vanilla');
-      sshClientRef.current = client;
-      setMode('ssh');
-      setPending(null);
-      setInput('');
-    },
-    [appendOutput],
-  );
-
-  const connectWithPassword = useCallback(
-    async (target, password) => {
-      const client = await SSHClient.connectWithPassword(
-        target.host,
-        target.port,
-        target.username,
-        password,
-      );
-      await establishShell(client);
-    },
-    [establishShell],
-  );
-
-  const connectWithKey = useCallback(
-    async (target, authPrep, passphrase = '') => {
-      console.log('[ForgeLite SSH] connectWithKey', {
-        host: target.host,
-        port: target.port,
-        username: target.username,
-        authMethod: 'publickey',
-        keyType: authPrep.keyType,
-        publicKeySource: authPrep.publicKeySource,
-        publicKeyAlgorithm: authPrep.diagnostics.publicKeyAlgorithm,
-        publicKeyPassedToClient: authPrep.diagnostics.publicKeyPassedToClient,
-        derivedKeyLength: authPrep.diagnostics.derivedKeyLength,
-        publicKeyPreview: authPrep.diagnostics.publicKeyPreview,
-      });
-
-      const result = await runTracedConnection(target, authPrep, { passphrase });
-      lastTraceRef.current = result.trace;
-
-      if (!result.success) {
-        throw result.error || new Error(result.trace.getSummary());
-      }
-
-      result.client.on('Shell', (data) => {
-        if (data) appendOutput(data);
-      });
-      sshClientRef.current = result.client;
-      setMode('ssh');
-      setPending(null);
-      setInput('');
-    },
-    [appendOutput],
-  );
-
-  const reportKeyAuthFailure = useCallback(
-    (error, target, authPrep) => {
-      const message = formatAuthError(error);
-      const trace = lastTraceRef.current;
-      const failureClass = trace?.failureStage || classifyAuthFailure(message);
-      const debug = {
-        message,
-        failureClass,
-        authMethod: 'publickey',
-        target: `${target.username}@${target.host}:${target.port}`,
-        keyType: authPrep.keyType,
-        publicKeySource: authPrep.publicKeySource,
-        extractionError: authPrep.extractionError || null,
-        nativeKeyDetails: authPrep.nativeKeyDetails || null,
-        diagnostics: authPrep.diagnostics,
-        rawError: error,
-        traceTimeline: trace?.formatTimeline() || null,
-        authSucceededBeforeFailure: trace?.events?.some((entry) =>
-          ['auth-complete', 'auth-success', 'js-auth-callback-success'].includes(entry.stage),
-        ),
-      };
-
-      lastAuthDebugRef.current = debug;
-      console.error('[ForgeLite SSH] key auth failed', debug);
-
-      appendOutput(`Connection failed: ${message}\n`);
-      appendOutput(`  failure class: ${failureClass}\n`);
-      appendOutput(`  auth method: publickey\n`);
-      appendOutput(`  key type: ${authPrep.keyType}\n`);
-      appendOutput(`  public key: ${authPrep.publicKeySource}\n`);
-      if (debug.authSucceededBeforeFailure) {
-        appendOutput('  auth succeeded before failure: yes\n');
-      } else {
-        appendOutput('  auth succeeded before failure: no\n');
-      }
-      if (authPrep.extractionError) {
-        appendOutput(`  public key extraction: ${authPrep.extractionError}\n`);
-      }
-      if (trace?.events?.length) {
-        appendOutput('  Run ssh-trace for full lifecycle timeline.\n');
-      } else {
-        appendOutput('  Run ssh-debug for key details.\n');
-      }
-    },
-    [appendOutput],
-  );
-
-  const beginSshConnect = useCallback(
-    async (target) => {
-      lastSshTargetRef.current = target;
-      const stored = await loadStoredKey();
-
-      if (stored?.key) {
-        appendOutput(`Connecting to ${target.host}:${target.port}...\n`);
-
-        const authPrep = await prepareKeyAuth(stored);
-        if (authPrep.extractionError && authPrep.keyType === 'openssh') {
-          reportKeyAuthFailure(
-            new Error(`Public key extraction failed: ${authPrep.extractionError}`),
-            target,
-            authPrep,
-          );
-          setPending({ ...target, keyAuthFailed: true });
-          setMode('password');
-          appendOutput(
-            `Password for ${target.username}@${target.host}: `,
-          );
-          return;
-        }
-
-        try {
-          await connectWithKey(target, authPrep);
-          return;
-        } catch (error) {
-          reportKeyAuthFailure(error, target, authPrep);
-          setPending({ ...target, keyAuthFailed: true });
-          setMode('password');
-          appendOutput(
-            `Password for ${target.username}@${target.host}: `,
-          );
-          return;
-        }
-      }
-
-      setPending(target);
-      setMode('password');
-      appendOutput(`${target.username}@${target.host}'s password: `);
-    },
-    [appendOutput, connectWithKey, reportKeyAuthFailure],
-  );
-
-  const saveKeyMaterial = useCallback(
-    async (rawKeyMaterial) => {
-      setMode('local');
-
-      const keyMaterial = wrapKey(rawKeyMaterial);
-
-      if (!keyMaterial) {
-        appendOutput('Error: no key provided.\n\n');
-        appendOutput(PROMPT);
-        return;
-      }
-
-      if (isPublicKeyContent(keyMaterial)) {
-        appendOutput('\nError: that is a PUBLIC key, not a private key.\n');
-        appendOutput('You need the PRIVATE key file: id_ed25519 (no .pub extension)\n');
-        appendOutput('On your PC run: cat ~/.ssh/id_ed25519\n\n');
-        appendOutput(PROMPT);
-        return;
-      }
-
-      let publicKey = null;
-      let publicKeySource = 'none';
-
-      try {
-        const extracted = extractPublicKeyFromPrivateKey(keyMaterial);
-        if (extracted?.publicKey) {
-          publicKey = extracted.publicKey;
-          publicKeySource = extracted.source;
-        }
-      } catch (error) {
-        appendOutput(
-          `Warning: could not extract public key (${formatAuthError(error)}).\n`,
-        );
-      }
-
-      await saveStoredKey(keyMaterial, publicKey);
-      appendOutput('Key saved successfully.\n');
-      appendOutput(`  type: ${detectKeyType(keyMaterial)}\n`);
-      appendOutput(
-        `  public key: ${publicKey ? `${publicKeySource} (${getPublicKeyAlgorithm(publicKey)})` : 'not extracted'}\n\n`,
-      );
-      appendOutput(PROMPT);
-    },
-    [appendOutput],
-  );
-
-  const finishKeyPaste = useCallback(async () => {
-    const keyMaterial = keyPasteLinesRef.current.join('\n').trim();
-    keyPasteLinesRef.current = [];
-    setInput('');
-    await saveKeyMaterial(keyMaterial);
-  }, [saveKeyMaterial]);
-
-  const startKeyPaste = useCallback(() => {
-    keyPasteLinesRef.current = [];
-    setInput('');
-    setMode('keypaste');
-    appendOutput(
-      'Note: Use your PRIVATE key (id_ed25519 or id_rsa, never the .pub file)\n' +
-        'On your PC: cat ~/.ssh/id_ed25519\n' +
-        "Paste your private key content and type 'done' when finished:\n",
-    );
-    inputRef.current?.focus();
-  }, [appendOutput]);
-
-  const runSshProbe = useCallback(
-    async (host, port) => {
-      appendOutput('=== ssh-probe ===\n');
-      appendOutput(`target: ${host}:${port}\n`);
-
-      try {
-        const result = await probeSshHost(host, port);
-        appendOutput(`tcp connect: ${result.tcpConnect}\n`);
-        appendOutput(`latency: ${result.latencyMs}ms\n`);
-        appendOutput(`ssh banner received: ${result.sshBannerReceived ? 'yes' : 'no'}\n`);
-        if (result.banner) {
-          appendOutput(`banner: ${result.banner}\n`);
-        }
-        appendOutput(`disconnect stage: ${result.disconnectStage || 'none'}\n`);
-        if (result.error) {
-          appendOutput(`error: ${result.error}\n`);
-        }
-        if (result.rawData) {
-          appendOutput(`raw data: ${result.rawData}\n`);
-        }
-      } catch (error) {
-        appendOutput(`tcp connect: failure\n`);
-        appendOutput(`latency: n/a\n`);
-        appendOutput('ssh banner received: no\n');
-        appendOutput(`error: ${formatAuthError(error)}\n`);
-        appendOutput('disconnect stage: tcp\n');
-      }
-
-      appendOutput('=== end ssh-probe ===\n\n');
-      appendOutput(PROMPT);
-    },
-    [appendOutput],
-  );
-
-  const startPasswordTest = useCallback(
-    (target) => {
-      lastSshTargetRef.current = target;
-      setPending({ ...target, passwordTest: true });
-      setMode('password');
-      appendOutput(
-        `Password-only test for ${target.username}@${target.host} (no key auth): `,
-      );
-      inputRef.current?.focus();
-    },
-    [],
-  );
-
-  const runSshTrace = useCallback(
-    async (targetOverride = null) => {
-      const target = targetOverride || lastSshTargetRef.current;
-      appendOutput('=== ssh-trace ===\n');
-
-      if (!target) {
-        appendOutput('No target. Use: ssh-trace user@host\n\n');
-        appendOutput(PROMPT);
-        return;
-      }
-
-      const stored = await loadStoredKey();
-      if (!stored?.key) {
-        appendOutput('No stored private key. Run ssh-add first.\n\n');
-        appendOutput(PROMPT);
-        return;
-      }
-
-      appendOutput(`target: ${target.username}@${target.host}:${target.port}\n`);
-      const authPrep = await prepareKeyAuth(stored);
-      appendOutput(`key type: ${authPrep.keyType}\n`);
-      appendOutput(`public key source: ${authPrep.publicKeySource}\n\n`);
-
-      const result = await runTracedConnection(target, authPrep, {
-        skipShell: false,
-      });
-      lastTraceRef.current = result.trace;
-
-      appendOutput('--- lifecycle timeline ---\n');
-      appendOutput(`${result.trace.formatTimeline()}\n`);
-      appendOutput('--- summary ---\n');
-      appendOutput(`result: ${result.success ? 'success' : 'failure'}\n`);
-      appendOutput(`failure class: ${result.trace.failureStage || (result.success ? 'none' : 'UNKNOWN_FAILURE')}\n`);
-
-      if (result.trace.failureMessage) {
-        appendOutput(`raw error: ${result.trace.failureMessage}\n`);
-      }
-
-      const sessionEvent = [...result.trace.events]
-        .reverse()
-        .find((entry) => entry.stage === 'session-status');
-      if (sessionEvent?.detail) {
-        appendOutput(
-          `session.isConnected: ${sessionEvent.detail.isConnected ? 'yes' : 'no'}\n`,
-        );
-        appendOutput(
-          `session.isAuthorized: ${sessionEvent.detail.isAuthorized ? 'yes' : 'no'}\n`,
-        );
-      }
-
-      const authBeforeFail = result.trace.events.some((entry) =>
-        ['auth-complete', 'auth-success'].includes(entry.stage),
-      );
-      appendOutput(`auth succeeded before failure: ${authBeforeFail ? 'yes' : 'no'}\n`);
-
-      if (result.client) {
-        try {
-          result.client.closeShell?.();
-        } catch {
-          /* ignore */
-        }
-        try {
-          result.client.disconnect();
-          appendOutput('disconnect: trace client closed\n');
-        } catch (disconnectError) {
-          appendOutput(`disconnect error: ${formatAuthError(disconnectError)}\n`);
-        }
-      }
-
-      appendOutput('=== end ssh-trace ===\n\n');
-      appendOutput(PROMPT);
-    },
-    [appendOutput],
-  );
-
-  const runSshDebug = useCallback(async () => {
-    const stored = await loadStoredKey();
-    const target = lastSshTargetRef.current;
-
-    appendOutput('=== ssh-debug ===\n');
-
-    if (!stored?.key) {
-      appendOutput('No stored private key.\n\n');
-      appendOutput(PROMPT);
-      return;
+    if (!res.ok) {
+      throw new Error(data?.message || data?.error || `${res.status} ${res.statusText}`);
     }
+    return data;
+  }
 
-    const authPrep = await prepareKeyAuth(stored);
-    appendOutput(`stored key first line: ${authPrep.diagnostics.firstLine}\n`);
-    appendOutput(`stored key last line: ${authPrep.diagnostics.lastLine}\n`);
-    appendOutput(`stored key length: ${authPrep.diagnostics.totalLength}\n`);
-    appendOutput(
-      `literal \\n present: ${authPrep.diagnostics.hasLiteralBackslashN ? 'yes' : 'no'}\n`,
-    );
-    appendOutput(`key type detected: ${authPrep.keyType}\n`);
-    appendOutput(`public key source: ${authPrep.publicKeySource}\n`);
-    appendOutput(`public key algorithm: ${authPrep.diagnostics.publicKeyAlgorithm}\n`);
-    appendOutput(`derived key length: ${authPrep.diagnostics.derivedKeyLength}\n`);
-    appendOutput(
-      `publicKey passed to SSHClient: ${authPrep.diagnostics.publicKeyPassedToClient ? 'yes' : 'no'}\n`,
-    );
-    appendOutput(`public key preview: ${authPrep.diagnostics.publicKeyPreview}\n`);
+  return {
+    request,
+    login: (email, password) =>
+      request(`${DASHBOARD_API_DEFAULT}/auth/login`, {
+        method: 'POST',
+        body: JSON.stringify({ email, password }),
+      }),
+    registerDevice: (expoPushToken) =>
+      request(`${DASHBOARD_API_DEFAULT}/devices/register`, {
+        method: 'POST',
+        body: JSON.stringify({ token: expoPushToken, platform: Platform.OS }),
+      }),
+    legionStatus: () => request(settings.legionHealthUrl || LEGION_HEALTH_DEFAULT),
+    wakeLegion: () => request(`${DASHBOARD_API_DEFAULT}/legion/wake`, { method: 'POST' }),
+    shutdownLegion: () => request(`${DASHBOARD_API_DEFAULT}/legion/shutdown`, { method: 'POST' }),
+    activeAgents: () => request(`${DASHBOARD_API_DEFAULT}/agents/active`),
+    stopAgent: (id) => request(`${DASHBOARD_API_DEFAULT}/agents/${id}/stop`, { method: 'POST' }),
+    launchAgent: (payload) =>
+      request(`${DASHBOARD_API_DEFAULT}/agents/launch`, {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      }),
+    agentLogs: (id) => request(`${DASHBOARD_API_DEFAULT}/agents/${id}/logs`),
+    stats: () => request(`${DASHBOARD_API_DEFAULT}/stats`),
+    activity: () => request(`${DASHBOARD_API_DEFAULT}/activity?limit=10`),
+    signals: () => request(`${INVEST_URL}/signals`),
+    news: (ticker) => request(`${INVEST_URL}/news/${encodeURIComponent(ticker)}`),
+    portfolio: () => request(`${INVEST_URL}/portfolio`),
+    trade: (signal) =>
+      request(`${INVEST_URL}/trade`, {
+        method: 'POST',
+        body: JSON.stringify(signal),
+      }),
+    githubRepos: () => request('https://api.github.com/users/Lordsleezy/repos?sort=updated&per_page=100'),
+  };
+}
 
-    if (authPrep.extractionError) {
-      appendOutput(`public key extraction error: ${authPrep.extractionError}\n`);
-    }
+function Panel({ children, style }) {
+  return <View style={[styles.panel, style]}>{children}</View>;
+}
 
-    if (authPrep.nativeKeyDetails?.keyType) {
-      appendOutput(
-        `native getKeyDetails: ${authPrep.nativeKeyDetails.keyType}` +
-          `${authPrep.nativeKeyDetails.keySize ? ` (${authPrep.nativeKeyDetails.keySize})` : ''}\n`,
-      );
-    } else if (authPrep.nativeKeyDetails?.error) {
-      appendOutput(`native getKeyDetails: ${authPrep.nativeKeyDetails.error}\n`);
-    }
-
-    if (target) {
-      appendOutput(
-        `last connection target: ${target.username}@${target.host}:${target.port}\n`,
-      );
-    } else {
-      appendOutput('last connection target: (none — run ssh user@host first)\n');
-    }
-
-    appendOutput('auth method: publickey\n');
-
-    if (lastTraceRef.current) {
-      appendOutput(`last trace failure class: ${lastTraceRef.current.failureStage || 'none'}\n`);
-      appendOutput('(run ssh-trace for full lifecycle timeline)\n');
-    }
-
-    if (lastAuthDebugRef.current) {
-      appendOutput(`last auth failure class: ${lastAuthDebugRef.current.failureClass}\n`);
-      appendOutput(`last raw SSH error: ${lastAuthDebugRef.current.message}\n`);
-    } else {
-      appendOutput('last raw SSH error: (none — no failed attempt this session)\n');
-    }
-
-    appendOutput(
-      'library: @dylankenneally/react-native-ssh-sftp (iOS NMSSH/libssh2)\n',
-    );
-    appendOutput('=== end ssh-debug ===\n\n');
-    appendOutput(PROMPT);
-  }, [appendOutput]);
-
-  const showStoredKey = useCallback(async () => {
-    const stored = await loadStoredKey();
-
-    if (!stored?.key) {
-      appendOutput('\nNo key stored.\n\n');
-      appendOutput(PROMPT);
-      return;
-    }
-
-    const storedKey = stored.key;
-    const lines = storedKey.split('\n');
-    const lineCount = lines.length;
-    const firstLines = lines.slice(0, 3).join('\n');
-    const lastLines = lines.slice(Math.max(0, lineCount - 3)).join('\n');
-    const processedKey = wrapKey(storedKey);
-    const storedType = detectKeyType(storedKey);
-    const effectiveType = detectKeyType(processedKey);
-    const wasRepaired = processedKey !== storedKey;
-
-    appendOutput('\nStored key preview:\n');
-    appendOutput(`--- first 3 lines ---\n${firstLines}\n`);
-    appendOutput(`--- last 3 lines ---\n${lastLines}\n`);
-    appendOutput(`(${lineCount} lines)\n`);
-    appendOutput(`stored key type: ${storedType}\n`);
-    appendOutput(`effective key type: ${effectiveType}\n`);
-    if (wasRepaired) {
-      appendOutput('note: key will be repaired on use (RSA body was in OpenSSH headers)\n');
-      appendOutput(`repaired first line: ${processedKey.split('\n')[0]}\n`);
-    }
-    appendOutput('\n');
-    appendOutput(PROMPT);
-  }, [appendOutput]);
-
-  const listSshKeys = useCallback(async () => {
-    const stored = await loadStoredKey();
-
-    if (!stored?.key) {
-      appendOutput('No stored keys.\n\n');
-      appendOutput(PROMPT);
-      return;
-    }
-
-    appendOutput(`1 key stored (added ${formatKeyDate(stored.addedAt)})\n\n`);
-    appendOutput(PROMPT);
-  }, [appendOutput]);
-
-  const removeSshKey = useCallback(
-    async (index) => {
-      if (index == null || Number.isNaN(index)) {
-        appendOutput('ssh-remove: missing index. Use: ssh-remove 1\n\n');
-        appendOutput(PROMPT);
-        return;
-      }
-
-      if (index !== 1) {
-        appendOutput(`ssh-remove: invalid index ${index}\n\n`);
-        appendOutput(PROMPT);
-        return;
-      }
-
-      const stored = await loadStoredKey();
-      if (!stored?.key) {
-        appendOutput('No stored keys.\n\n');
-        appendOutput(PROMPT);
-        return;
-      }
-
-      await clearStoredKey();
-      appendOutput('Key removed.\n\n');
-      appendOutput(PROMPT);
-    },
-    [appendOutput],
-  );
-
-  const submitCommand = useCallback(async () => {
-    if (mode === 'keypaste') {
-      const line = input;
-      setInput('');
-
-      if (line.includes('\n')) {
-        const lines = line.split('\n');
-        while (lines.length && lines[lines.length - 1].trim() === '') {
-          lines.pop();
-        }
-        if (lines.length && lines[lines.length - 1].trim().toLowerCase() === 'done') {
-          lines.pop();
-          keyPasteLinesRef.current.push(...lines);
-          lines.forEach((entry) => appendOutput(`${entry}\n`));
-          appendOutput('done\n');
-          await finishKeyPaste();
-          return;
-        }
-        keyPasteLinesRef.current.push(...lines);
-        lines.forEach((entry) => appendOutput(`${entry}\n`));
-        return;
-      }
-
-      if (line.trim().toLowerCase() === 'done') {
-        appendOutput('done\n');
-        await finishKeyPaste();
-        return;
-      }
-
-      keyPasteLinesRef.current.push(line);
-      appendOutput(`${line}\n`);
-      return;
-    }
-
-    if (mode === 'password') {
-      const password = input;
-      const target = pending;
-      setInput('');
-      appendOutput('\n');
-
-      if (!target) {
-        setMode('local');
-        appendOutput(PROMPT);
-        return;
-      }
-
-      if (target.passwordTest) {
-        appendOutput(`Running password-only transport test to ${target.host}:${target.port}...\n`);
-        const result = await runTracedPasswordConnection(target, password, {
-          skipShell: true,
-        });
-        lastTraceRef.current = result.trace;
-
-        appendOutput(`result: ${result.success ? 'success' : 'failure'}\n`);
-        appendOutput(
-          `failure class: ${result.trace.failureStage || (result.success ? 'none' : 'UNKNOWN_FAILURE')}\n`,
-        );
-        if (result.trace.failureMessage) {
-          appendOutput(`raw error: ${result.trace.failureMessage}\n`);
-        }
-
-        const sessionEvent = [...result.trace.events]
-          .reverse()
-          .find((entry) => entry.stage === 'session-status');
-        if (sessionEvent?.detail) {
-          appendOutput(
-            `session.isConnected: ${sessionEvent.detail.isConnected ? 'yes' : 'no'}\n`,
-          );
-          appendOutput(
-            `session.isAuthorized: ${sessionEvent.detail.isAuthorized ? 'yes' : 'no'}\n`,
-          );
-        }
-
-        appendOutput('--- timeline ---\n');
-        appendOutput(`${result.trace.formatTimeline()}\n`);
-
-        if (result.client) {
-          try {
-            result.client.disconnect();
-          } catch {
-            /* ignore */
-          }
-        }
-
-        if (result.success) {
-          appendOutput(
-            'Password auth succeeded — transport/KEX works; issue is likely publickey negotiation only.\n',
-          );
-        } else {
-          const beforeAuth = result.trace.events.some((entry) =>
-            ['auth-complete', 'auth-success', 'handshake-complete'].includes(entry.stage),
-          );
-          if (!beforeAuth) {
-            appendOutput(
-              'Failed before auth — NMSSH/libssh2 transport/KEX with Windows OpenSSH is failing.\n',
-            );
-          } else {
-            appendOutput('Failed during/after auth — check password or server auth settings.\n');
-          }
-        }
-
-        setMode('local');
-        setPending(null);
-        appendOutput(PROMPT);
-        return;
-      }
-
-      if (!target.keyAuthFailed) {
-        appendOutput(`Connecting to ${target.host}:${target.port}...\n`);
-      }
-
-      try {
-        await connectWithPassword(target, password);
-      } catch (err) {
-        const message = err?.message || String(err);
-        appendOutput(`\nError: ${message}\n\n${PROMPT}`);
-        sshClientRef.current = null;
-        setMode('local');
-        setPending(null);
-      }
-      return;
-    }
-
-    if (mode === 'ssh') {
-      const line = input;
-      const trimmed = line.trim().toLowerCase();
-      if (trimmed === 'exit' || trimmed === 'logout') {
-        writeToShell(`${line}\n`);
-        setInput('');
-        setTimeout(() => {
-          appendOutput('\n');
-          disconnect();
-          appendOutput(PROMPT);
-        }, 80);
-        return;
-      }
-      writeToShell(`${line}\n`);
-      setInput('');
-      return;
-    }
-
-    const line = input;
-    appendOutput(`${line}\n`);
-    pushHistory(line);
-    setInput('');
-
-    const trimmed = line.trim();
-    if (!trimmed) {
-      appendOutput(PROMPT);
-      return;
-    }
-
-    const lower = trimmed.toLowerCase();
-
-    if (lower === 'ssh-add') {
-      startKeyPaste();
-      return;
-    }
-
-    if (lower === 'ssh-keys') {
-      await listSshKeys();
-      return;
-    }
-
-    if (lower === 'ssh-show') {
-      await showStoredKey();
-      return;
-    }
-
-    if (lower === 'ssh-debug') {
-      await runSshDebug();
-      return;
-    }
-
-    const traceParsed = parseSshTraceCommand(trimmed);
-    if (traceParsed.type === 'use_last') {
-      await runSshTrace();
-      return;
-    }
-    if (traceParsed.type === 'ok') {
-      await runSshTrace({
-        username: traceParsed.username,
-        host: traceParsed.host,
-        port: traceParsed.port,
-      });
-      return;
-    }
-    if (lower.startsWith('ssh-trace')) {
-      appendOutput('ssh-trace: invalid syntax. Use: ssh-trace user@host\n\n');
-      appendOutput(PROMPT);
-      return;
-    }
-
-    const probeParsed = parseSshProbeCommand(trimmed);
-    if (probeParsed.type === 'ok') {
-      await runSshProbe(probeParsed.host, probeParsed.port);
-      return;
-    }
-    if (lower.startsWith('ssh-probe')) {
-      appendOutput('ssh-probe: invalid syntax. Use: ssh-probe host[:port]\n\n');
-      appendOutput(PROMPT);
-      return;
-    }
-
-    const passwordTestParsed = parseSshPasswordTestCommand(trimmed);
-    if (passwordTestParsed.type === 'ok') {
-      startPasswordTest({
-        username: passwordTestParsed.username,
-        host: passwordTestParsed.host,
-        port: passwordTestParsed.port,
-      });
-      return;
-    }
-    if (lower.startsWith('ssh-password-test')) {
-      appendOutput(
-        'ssh-password-test: invalid syntax. Use: ssh-password-test user@host\n\n',
-      );
-      appendOutput(PROMPT);
-      return;
-    }
-
-    const removeIndex = parseRemoveIndex(trimmed);
-    if (removeIndex !== null || lower === 'ssh-remove') {
-      await removeSshKey(removeIndex);
-      return;
-    }
-
-    const parsed = parseSshCommand(line);
-    if (parsed.type === 'ok') {
-      await beginSshConnect({
-        username: parsed.username,
-        host: parsed.host,
-        port: parsed.port,
-      });
-      return;
-    }
-
-    if (parsed.type === 'missing_username') {
-      appendOutput('ssh: missing username. Use: ssh user@host\n\n');
-      appendOutput(PROMPT);
-      return;
-    }
-
-    if (parsed.type === 'invalid' || lower.startsWith('ssh')) {
-      appendOutput('ssh: invalid syntax. Use: ssh user@host\n\n');
-      appendOutput(PROMPT);
-      return;
-    }
-
-    appendOutput(`${trimmed.split(/\s+/)[0]}: command not found\n\n`);
-    appendOutput(PROMPT);
-  }, [
-    mode,
-    input,
-    pending,
-    appendOutput,
-    pushHistory,
-    connectWithPassword,
-    disconnect,
-    writeToShell,
-    startKeyPaste,
-    finishKeyPaste,
-    listSshKeys,
-    showStoredKey,
-    runSshDebug,
-    runSshTrace,
-    runSshProbe,
-    startPasswordTest,
-    removeSshKey,
-    beginSshConnect,
-  ]);
-
-  const showInput = mode !== 'password';
-
+function Button({ label, onPress, tone = 'primary', disabled = false, style }) {
   return (
-    <KeyboardAvoidingView
-      style={styles.root}
-      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-    >
-      <StatusBar style="light" />
-      <ScrollView
-        ref={scrollRef}
-        style={styles.terminalScroll}
-        contentContainerStyle={styles.terminalContent}
-        keyboardShouldPersistTaps="handled"
-      >
-        <Text style={styles.terminalText} selectable>
-          {output}
-          {showInput ? input : ''}
-          <Text style={{ opacity: cursorVisible ? 1 : 0 }}>▌</Text>
-        </Text>
-      </ScrollView>
+    <Pressable
+      accessibilityRole="button"
+      disabled={disabled}
+      onPress={onPress}
+      style={({ pressed }) => [
+        styles.button,
+        styles[`button_${tone}`],
+        disabled && styles.buttonDisabled,
+        pressed && !disabled && styles.pressed,
+        style,
+      ]}>
+      <Text style={[styles.buttonText, tone === 'ghost' && styles.buttonTextGhost]} numberOfLines={1}>
+        {label}
+      </Text>
+    </Pressable>
+  );
+}
 
-      {Platform.OS === 'ios' ? (
-        <InputAccessoryView nativeID={INPUT_ACCESSORY_ID}>
-          <View style={styles.keyboardAccessory}>
-            <Pressable
-              onPress={() => Keyboard.dismiss()}
-              style={styles.keyboardDoneButton}
-            >
-              <Text style={styles.keyboardDoneText}>Done</Text>
-            </Pressable>
-          </View>
-        </InputAccessoryView>
-      ) : null}
-
+function Field({ label, value, onChangeText, secureTextEntry, multiline, placeholder, keyboardType }) {
+  return (
+    <View style={styles.fieldWrap}>
+      <Text style={styles.label}>{label}</Text>
       <TextInput
-        ref={inputRef}
-        style={styles.hiddenInput}
-        value={input}
-        onChangeText={setInput}
-        onSubmitEditing={submitCommand}
+        value={value}
+        onChangeText={onChangeText}
+        placeholder={placeholder}
+        placeholderTextColor="#64748b"
+        secureTextEntry={secureTextEntry}
+        multiline={multiline}
+        keyboardType={keyboardType}
         autoCapitalize="none"
-        autoCorrect={false}
-        autoFocus
-        blurOnSubmit={false}
-        keyboardType="ascii-capable"
-        secureTextEntry={mode === 'password'}
-        contextMenuHidden={mode === 'password'}
-        inputAccessoryViewID={
-          Platform.OS === 'ios' ? INPUT_ACCESSORY_ID : undefined
-        }
+        style={[styles.input, multiline && styles.textarea]}
       />
+    </View>
+  );
+}
+
+function Badge({ children, tone = 'muted' }) {
+  return (
+    <View style={[styles.badge, styles[`badge_${tone}`]]}>
+      <Text style={[styles.badgeText, tone === 'danger' && styles.badgeTextDanger]}>{children}</Text>
+    </View>
+  );
+}
+
+function Skeleton({ rows = 3 }) {
+  return (
+    <View style={styles.skeletonWrap}>
+      {Array.from({ length: rows }).map((_, index) => (
+        <View key={index} style={[styles.skeleton, { width: `${92 - index * 9}%` }]} />
+      ))}
+    </View>
+  );
+}
+
+function ErrorState({ message, onRetry }) {
+  return (
+    <Panel style={styles.errorPanel}>
+      <Text style={styles.errorTitle}>Unable to load</Text>
+      <Text style={styles.muted}>{message}</Text>
+      <Button label="Retry" onPress={onRetry} tone="secondary" style={styles.retryButton} />
+    </Panel>
+  );
+}
+
+function LoginScreen({ onLogin }) {
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const submit = async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const data = await makeApi(null, { legionHealthUrl: LEGION_HEALTH_DEFAULT }).login(email.trim(), password);
+      const token = data?.token || data?.sessionToken || data?.access_token || data?.accessToken;
+      if (!token) throw new Error('Login succeeded, but no session token was returned.');
+      await SecureStore.setItemAsync(AUTH_TOKEN_KEY, token);
+      onLogin(token);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={styles.loginRoot}>
+      <StatusBar style="light" />
+      <View style={styles.loginBox}>
+        <Text style={styles.brand}>Sentinel Command</Text>
+        <Text style={styles.subhead}>Secure mobile control for Sentinel Prime.</Text>
+        <Field label="Email" value={email} onChangeText={setEmail} keyboardType="email-address" placeholder="paul@example.com" />
+        <Field label="Password" value={password} onChangeText={setPassword} secureTextEntry placeholder="Password" />
+        {error ? <Text style={styles.errorText}>{error}</Text> : null}
+        <Button label={loading ? 'Authenticating...' : 'Login'} onPress={submit} disabled={loading || !email || !password} />
+      </View>
     </KeyboardAvoidingView>
   );
 }
 
+function HomeScreen({ api, token, settings }) {
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [error, setError] = useState('');
+  const [legion, setLegion] = useState({ online: false });
+  const [agents, setAgents] = useState([]);
+  const [stats, setStats] = useState({});
+  const [activity, setActivity] = useState([]);
+
+  const load = useCallback(async () => {
+    setError('');
+    try {
+      const [legionResult, agentsResult, statsResult, activityResult] = await Promise.allSettled([
+        api.legionStatus(),
+        api.activeAgents(),
+        api.stats(),
+        api.activity(),
+      ]);
+      setLegion(
+        legionResult.status === 'fulfilled'
+          ? { online: true, ...(legionResult.value || {}) }
+          : { online: false, error: legionResult.reason?.message },
+      );
+      setAgents(agentsResult.status === 'fulfilled' ? normalizeList(agentsResult.value, ['agents', 'jobs']) : fallbackAgents);
+      setStats(statsResult.status === 'fulfilled' ? statsResult.value || {} : {});
+      setActivity(activityResult.status === 'fulfilled' ? normalizeList(activityResult.value, ['activity', 'events']).slice(0, 10) : fallbackActivity);
+      if (legionResult.status === 'rejected') setError(legionResult.reason?.message || 'Legion status failed.');
+    } finally {
+      setLoading(false);
+      setRefreshing(false);
+    }
+  }, [api]);
+
+  useEffect(() => {
+    load();
+  }, [load, token, settings.legionHealthUrl]);
+
+  const confirmShutdown = () => {
+    Alert.alert('Shutdown Legion?', 'This will request a controlled shutdown through the dashboard API.', [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Shutdown',
+        style: 'destructive',
+        onPress: async () => {
+          try {
+            await api.shutdownLegion();
+            await load();
+          } catch (err) {
+            Alert.alert('Shutdown failed', err.message);
+          }
+        },
+      },
+    ]);
+  };
+
+  if (loading) {
+    return (
+      <ScrollView style={styles.screen} contentContainerStyle={styles.content}>
+        <Skeleton rows={8} />
+      </ScrollView>
+    );
+  }
+
+  return (
+    <ScrollView
+      style={styles.screen}
+      contentContainerStyle={styles.content}
+      refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); load(); }} tintColor="#2dd4bf" />}>
+      {error ? <ErrorState message={error} onRetry={load} /> : null}
+      <Panel>
+        <View style={styles.rowBetween}>
+          <View>
+            <Text style={styles.panelTitle}>Legion</Text>
+            <Text style={styles.muted}>{settings.legionHealthUrl || LEGION_HEALTH_DEFAULT}</Text>
+          </View>
+          <Badge tone={legion.online ? 'success' : 'danger'}>{legion.online ? 'Online' : 'Offline'}</Badge>
+        </View>
+        <View style={styles.actions}>
+          <Button label="Wake" onPress={async () => { await api.wakeLegion(); load(); }} tone="secondary" />
+          <Button label="Shutdown" onPress={confirmShutdown} tone="danger" />
+        </View>
+      </Panel>
+
+      <View style={styles.statsGrid}>
+        <Panel style={styles.statCard}>
+          <Text style={styles.statValue}>{stats.productsListedToday ?? stats.products_listed_today ?? 0}</Text>
+          <Text style={styles.muted}>Products today</Text>
+        </Panel>
+        <Panel style={styles.statCard}>
+          <Text style={styles.statValue}>{stats.openTrades ?? stats.open_trades ?? 0}</Text>
+          <Text style={styles.muted}>Open trades</Text>
+        </Panel>
+        <Panel style={styles.statCard}>
+          <Text style={styles.statValue}>{stats.pendingSignals ?? stats.pending_signals ?? 0}</Text>
+          <Text style={styles.muted}>Pending signals</Text>
+        </Panel>
+      </View>
+
+      <Panel>
+        <Text style={styles.panelTitle}>Active agents</Text>
+        <FlatList
+          data={agents}
+          keyExtractor={(item, index) => String(item.id || item.jobId || `${item.name}-${index}`)}
+          scrollEnabled={false}
+          ListEmptyComponent={<Text style={styles.muted}>No running jobs.</Text>}
+          renderItem={({ item }) => (
+            <View style={styles.listRow}>
+              <View style={styles.flex}>
+                <Text style={styles.itemTitle}>{item.name || item.agent || 'Agent'}</Text>
+                <Text style={styles.muted}>{item.status || 'unknown'} - {compactTime(item.startedAt || item.started_at)}</Text>
+              </View>
+              <Button label="Stop" tone="danger" onPress={() => api.stopAgent(item.id || item.jobId).then(load).catch((err) => Alert.alert('Stop failed', err.message))} style={styles.smallButton} />
+            </View>
+          )}
+        />
+      </Panel>
+
+      <Panel>
+        <Text style={styles.panelTitle}>Recent activity</Text>
+        <FlatList
+          data={activity}
+          keyExtractor={(item, index) => String(item.id || `${item.service}-${index}`)}
+          scrollEnabled={false}
+          renderItem={({ item }) => (
+            <View style={styles.activityRow}>
+              <Text style={styles.itemTitle}>{item.service || item.type || 'Sentinel'}</Text>
+              <Text style={styles.muted}>{item.message || item.event || item.description}</Text>
+              <Text style={styles.timestamp}>{compactTime(item.time || item.createdAt || item.created_at)}</Text>
+            </View>
+          )}
+        />
+      </Panel>
+    </ScrollView>
+  );
+}
+
+function InvestScreen({ api }) {
+  const [view, setView] = useState('signals');
+  const [signals, setSignals] = useState([]);
+  const [portfolio, setPortfolio] = useState(null);
+  const [selected, setSelected] = useState(null);
+  const [news, setNews] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const [signalsData, portfolioData] = await Promise.allSettled([api.signals(), api.portfolio()]);
+      if (signalsData.status === 'fulfilled') setSignals(normalizeList(signalsData.value, ['signals']));
+      else {
+        setSignals(fallbackSignals);
+        setError(signalsData.reason?.message || 'Signals endpoint failed.');
+      }
+      if (portfolioData.status === 'fulfilled') setPortfolio(portfolioData.value);
+    } finally {
+      setLoading(false);
+    }
+  }, [api]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const openSignal = async (signal) => {
+    setSelected(signal);
+    setNews([]);
+    try {
+      const data = await api.news(signal.ticker);
+      setNews(normalizeList(data, ['news', 'headlines']).slice(0, 5));
+    } catch {
+      setNews([{ title: `${signal.ticker} news feed unavailable`, sentiment: 'neutral' }]);
+    }
+  };
+
+  if (loading) {
+    return (
+      <ScrollView style={styles.screen} contentContainerStyle={styles.content}>
+        <Skeleton rows={9} />
+      </ScrollView>
+    );
+  }
+
+  return (
+    <View style={styles.screen}>
+      <View style={styles.segment}>
+        <Pressable onPress={() => setView('signals')} style={[styles.segmentItem, view === 'signals' && styles.segmentActive]}>
+          <Text style={styles.segmentText}>Signals</Text>
+        </Pressable>
+        <Pressable onPress={() => setView('portfolio')} style={[styles.segmentItem, view === 'portfolio' && styles.segmentActive]}>
+          <Text style={styles.segmentText}>Portfolio</Text>
+        </Pressable>
+      </View>
+      {error ? <View style={styles.contentTight}><ErrorState message={error} onRetry={load} /></View> : null}
+      {view === 'signals' ? (
+        <FlatList
+          data={signals}
+          keyExtractor={(item, index) => String(item.id || item.ticker || index)}
+          contentContainerStyle={styles.content}
+          renderItem={({ item }) => (
+            <Pressable onPress={() => openSignal(item)} style={styles.signalCard}>
+              <View style={styles.rowBetween}>
+                <View>
+                  <Text style={styles.signalTicker}>{item.ticker}</Text>
+                  <Text style={styles.muted}>Entry {money(item.entry)} - Target {money(item.target)} - Stop {money(item.stop)}</Text>
+                </View>
+                <View style={styles.alignEnd}>
+                  <Badge tone={String(item.direction).toUpperCase() === 'SHORT' ? 'warning' : 'success'}>{item.direction || 'LONG'}</Badge>
+                  <Badge tone={Number(item.confidence) > 80 ? 'danger' : 'muted'}>{pct(item.confidence)}</Badge>
+                </View>
+              </View>
+            </Pressable>
+          )}
+        />
+      ) : (
+        <ScrollView style={styles.screen} contentContainerStyle={styles.content}>
+          <Panel>
+            <Text style={styles.panelTitle}>P&L</Text>
+            <Text style={[styles.statValue, Number(portfolio?.pnl) < 0 && styles.negative]}>{money(portfolio?.pnl ?? portfolio?.profitLoss ?? 0)}</Text>
+          </Panel>
+          <Panel>
+            <Text style={styles.panelTitle}>Open positions</Text>
+            <FlatList
+              data={normalizeList(portfolio, ['positions', 'openPositions'])}
+              keyExtractor={(item, index) => String(item.id || item.ticker || index)}
+              scrollEnabled={false}
+              ListEmptyComponent={<Text style={styles.muted}>No open positions reported.</Text>}
+              renderItem={({ item }) => <Text style={styles.itemTitle}>{item.ticker || item.symbol} - {item.qty || item.quantity} - {money(item.marketValue || item.value)}</Text>}
+            />
+          </Panel>
+          <Panel>
+            <Text style={styles.panelTitle}>Trade history</Text>
+            <FlatList
+              data={normalizeList(portfolio, ['history', 'trades'])}
+              keyExtractor={(item, index) => String(item.id || index)}
+              scrollEnabled={false}
+              ListEmptyComponent={<Text style={styles.muted}>No trades reported.</Text>}
+              renderItem={({ item }) => <Text style={styles.itemTitle}>{compactTime(item.time || item.createdAt)} - {item.ticker || item.symbol} - {item.side || item.action}</Text>}
+            />
+          </Panel>
+        </ScrollView>
+      )}
+      <TradeBriefing signal={selected} news={news} onClose={() => setSelected(null)} onApprove={(signal) => api.trade(signal)} />
+    </View>
+  );
+}
+
+function TradeBriefing({ signal, news, onClose, onApprove }) {
+  if (!signal) return null;
+  const technicals = signal.technicals || signal.technical || {};
+  const bullCase = signal.bullCase || signal.bull_case || [];
+  const bearCase = signal.bearCase || signal.bear_case || [];
+  const rr = Math.abs(Number(signal.target) - Number(signal.entry)) / Math.max(0.01, Math.abs(Number(signal.entry) - Number(signal.stop)));
+
+  const approve = () => {
+    Alert.alert('Approve trade?', `${signal.ticker} ${signal.direction || 'LONG'} at ${money(signal.entry)}`, [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Approve',
+        onPress: async () => {
+          try {
+            await onApprove(signal);
+            onClose();
+          } catch (err) {
+            Alert.alert('Trade failed', err.message);
+          }
+        },
+      },
+    ]);
+  };
+
+  return (
+    <Modal animationType="slide" visible transparent>
+      <View style={styles.modalShade}>
+        <View style={styles.modalSheet}>
+          <ScrollView>
+            <View style={styles.rowBetween}>
+              <Text style={styles.modalTitle}>{signal.ticker} Briefing</Text>
+              <Button label="Close" onPress={onClose} tone="ghost" style={styles.smallButton} />
+            </View>
+            <Panel>
+              <Text style={styles.panelTitle}>Technical summary</Text>
+              <Text style={styles.itemTitle}>RSI: {technicals.rsi ?? '-'}</Text>
+              <Text style={styles.itemTitle}>MACD: {technicals.macd ?? '-'}</Text>
+              <Text style={styles.itemTitle}>Volume: {technicals.volume ?? '-'}</Text>
+            </Panel>
+            <Panel>
+              <Text style={styles.panelTitle}>News</Text>
+              {news.map((item, index) => (
+                <View key={String(item.id || index)} style={styles.newsRow}>
+                  <Text style={styles.itemTitle}>{item.title || item.headline}</Text>
+                  <Badge tone={item.sentiment === 'negative' ? 'danger' : item.sentiment === 'positive' ? 'success' : 'muted'}>
+                    {item.sentiment || 'neutral'}
+                  </Badge>
+                </View>
+              ))}
+            </Panel>
+            <Panel>
+              <Text style={styles.panelTitle}>Bull case</Text>
+              {(bullCase.length ? bullCase : ['No bull case supplied.']).map((item, index) => <Text key={index} style={styles.bullet}>- {item}</Text>)}
+            </Panel>
+            <Panel>
+              <Text style={styles.panelTitle}>Bear case</Text>
+              {(bearCase.length ? bearCase : ['No bear case supplied.']).map((item, index) => <Text key={index} style={styles.bullet}>- {item}</Text>)}
+            </Panel>
+            <Panel>
+              <Text style={styles.panelTitle}>Risk / reward</Text>
+              <Text style={styles.itemTitle}>Entry {money(signal.entry)} - Target {money(signal.target)} - Stop {money(signal.stop)}</Text>
+              <Text style={styles.itemTitle}>R/R {Number.isFinite(rr) ? rr.toFixed(2) : '-'}</Text>
+            </Panel>
+            <View style={styles.actions}>
+              <Button label="Approve Trade" onPress={approve} />
+              <Button label="Pass" onPress={onClose} tone="secondary" />
+            </View>
+          </ScrollView>
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
+function AgentsScreen({ api, openClaudeTab }) {
+  const [repos, setRepos] = useState([]);
+  const [repo, setRepo] = useState('');
+  const [agent, setAgent] = useState('Codex');
+  const [prompt, setPrompt] = useState('');
+  const [agents, setAgents] = useState([]);
+  const [detail, setDetail] = useState(null);
+  const [logs, setLogs] = useState('');
+  const [loading, setLoading] = useState(true);
+
+  const load = useCallback(async () => {
+    try {
+      const [reposData, agentsData] = await Promise.allSettled([api.githubRepos(), api.activeAgents()]);
+      if (reposData.status === 'fulfilled') {
+        const names = normalizeList(reposData.value).map((item) => item.name).filter(Boolean);
+        setRepos(names);
+        if (!repo && names.length) setRepo(names[0]);
+      }
+      setAgents(agentsData.status === 'fulfilled' ? normalizeList(agentsData.value, ['agents', 'jobs']) : fallbackAgents);
+    } finally {
+      setLoading(false);
+    }
+  }, [api, repo]);
+
+  useEffect(() => {
+    load();
+    const timer = setInterval(load, 30000);
+    return () => clearInterval(timer);
+  }, [load]);
+
+  useEffect(() => {
+    const timer = setInterval(async () => {
+      const shared = await SecureStore.getItemAsync(SHARED_PROMPT_KEY);
+      if (shared) {
+        setPrompt(shared);
+        await SecureStore.deleteItemAsync(SHARED_PROMPT_KEY);
+      }
+    }, 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const launch = async () => {
+    try {
+      await api.launchAgent({ repo, agent, prompt, legion: { host: '192.168.0.117', user: 'pgg12' } });
+      setPrompt('');
+      await load();
+    } catch (err) {
+      Alert.alert('Launch failed', err.message);
+    }
+  };
+
+  const openDetail = async (item) => {
+    setDetail(item);
+    setLogs('Loading logs...');
+    try {
+      const data = await api.agentLogs(item.id || item.jobId);
+      setLogs(data?.logs || data?.text || JSON.stringify(data, null, 2));
+    } catch (err) {
+      setLogs(err.message);
+    }
+  };
+
+  return (
+    <ScrollView style={styles.screen} contentContainerStyle={styles.content}>
+      <Panel>
+        <Text style={styles.panelTitle}>Launch Agent</Text>
+        <Text style={styles.label}>Repo</Text>
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.chips}>
+          {(repos.length ? repos : ['sentinel-command']).map((name) => (
+            <Pressable key={name} onPress={() => setRepo(name)} style={[styles.chip, repo === name && styles.chipActive]}>
+              <Text style={styles.chipText}>{name}</Text>
+            </Pressable>
+          ))}
+        </ScrollView>
+        <Text style={styles.label}>Agent</Text>
+        <View style={styles.chipRow}>
+          {['Codex', 'Cursor', 'Cline'].map((name) => (
+            <Pressable key={name} onPress={() => setAgent(name)} style={[styles.chip, agent === name && styles.chipActive]}>
+              <Text style={styles.chipText}>{name}</Text>
+            </Pressable>
+          ))}
+        </View>
+        <Field label="Prompt" value={prompt} onChangeText={setPrompt} multiline placeholder="Describe the job for the selected agent." />
+        <View style={styles.actions}>
+          <Button label="Get Prompt from Claude" onPress={() => openClaudeTab(prompt)} tone="secondary" />
+          <Button label="Launch" onPress={launch} disabled={!repo || !prompt.trim()} />
+        </View>
+      </Panel>
+
+      <Panel>
+        <View style={styles.rowBetween}>
+          <Text style={styles.panelTitle}>Active agents</Text>
+          {loading ? <ActivityIndicator color="#2dd4bf" /> : null}
+        </View>
+        <FlatList
+          data={agents}
+          keyExtractor={(item, index) => String(item.id || item.jobId || index)}
+          scrollEnabled={false}
+          ListEmptyComponent={<Text style={styles.muted}>No active agents.</Text>}
+          renderItem={({ item }) => (
+            <Pressable onPress={() => openDetail(item)} style={styles.listRow}>
+              <View style={styles.flex}>
+                <Text style={styles.itemTitle}>{item.agent || item.name || 'Agent'} on {item.repo || 'repo'}</Text>
+                <Text style={styles.muted}>{item.status || 'unknown'} - {compactTime(item.startedAt || item.started_at)}</Text>
+              </View>
+              <Badge>{item.status || 'live'}</Badge>
+            </Pressable>
+          )}
+        />
+      </Panel>
+
+      <Modal visible={Boolean(detail)} animationType="slide" transparent>
+        <View style={styles.modalShade}>
+          <View style={styles.modalSheet}>
+            <View style={styles.rowBetween}>
+              <Text style={styles.modalTitle}>{detail?.agent || detail?.name || 'Agent'} Logs</Text>
+              <Button label="Close" onPress={() => setDetail(null)} tone="ghost" style={styles.smallButton} />
+            </View>
+            <ScrollView style={styles.logBox}>
+              <Text style={styles.logText}>{logs}</Text>
+            </ScrollView>
+            <View style={styles.actions}>
+              <Button label="Stop" tone="danger" onPress={() => api.stopAgent(detail?.id || detail?.jobId).then(() => { setDetail(null); load(); })} />
+              <Button label="Redirect prompt" tone="secondary" onPress={() => { setPrompt(`Continue this job with the following context:\n\n${logs}`); setDetail(null); }} />
+            </View>
+          </View>
+        </View>
+      </Modal>
+    </ScrollView>
+  );
+}
+
+function ClaudeScreen({ initialPrompt = '', onShareToAgent }) {
+  const [apiKey, setApiKey] = useState('');
+  const [input, setInput] = useState(initialPrompt);
+  const [messages, setMessages] = useState([]);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    SecureStore.getItemAsync(ANTHROPIC_KEY).then((key) => setApiKey(key || ''));
+  }, []);
+
+  useEffect(() => {
+    if (initialPrompt) setInput(initialPrompt);
+  }, [initialPrompt]);
+
+  const send = async () => {
+    if (!input.trim()) return;
+    if (!apiKey) {
+      Alert.alert('Anthropic key required', 'Add your Anthropic API key in Settings first.');
+      return;
+    }
+    const userMessage = { role: 'user', content: input.trim() };
+    const next = [...messages, userMessage];
+    setMessages(next);
+    setInput('');
+    setLoading(true);
+    try {
+      const res = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01',
+          'anthropic-dangerous-direct-browser-access': 'true',
+        },
+        body: JSON.stringify({
+          model: CLAUDE_MODEL,
+          max_tokens: 1200,
+          system: SYSTEM_PROMPT,
+          messages: next.map((message) => ({ role: message.role, content: message.content })),
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error?.message || `${res.status} ${res.statusText}`);
+      const text = data?.content?.map((part) => part.text).filter(Boolean).join('\n') || '';
+      setMessages([...next, { role: 'assistant', content: text }]);
+    } catch (err) {
+      setMessages([...next, { role: 'assistant', content: `Claude request failed: ${err.message}` }]);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const voiceInput = () => {
+    Speech.speak('Voice capture needs a speech recognition module. Dictate your prompt into the text field for now.', {
+      rate: 0.95,
+    });
+  };
+
+  return (
+    <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={styles.screen}>
+      <FlatList
+        data={messages}
+        keyExtractor={(_, index) => String(index)}
+        contentContainerStyle={styles.chatContent}
+        ListEmptyComponent={
+          <Panel>
+            <Text style={styles.panelTitle}>Claude Chat</Text>
+            <Text style={styles.muted}>Ask for strategy, debugging help, or a ready-to-run agent prompt.</Text>
+          </Panel>
+        }
+        renderItem={({ item }) => (
+          <View style={[styles.message, item.role === 'user' ? styles.messageUser : styles.messageAssistant]}>
+            <Text style={styles.messageRole}>{item.role === 'user' ? 'Paul' : 'Claude'}</Text>
+            <Text style={styles.messageText}>{item.content}</Text>
+            {item.role === 'assistant' ? <Button label="Share to Agent" tone="ghost" onPress={() => onShareToAgent(item.content)} style={styles.shareButton} /> : null}
+          </View>
+        )}
+      />
+      <View style={styles.composer}>
+        <TextInput
+          value={input}
+          onChangeText={setInput}
+          placeholder="Message Claude"
+          placeholderTextColor="#64748b"
+          multiline
+          style={styles.composerInput}
+        />
+        <Button label="Voice" onPress={voiceInput} tone="secondary" style={styles.composerButton} />
+        <Button label={loading ? '...' : 'Send'} onPress={send} disabled={loading} style={styles.composerButton} />
+      </View>
+    </KeyboardAvoidingView>
+  );
+}
+
+function SettingsScreen({ settings, setSettings, onLogout }) {
+  const [apiKey, setApiKey] = useState('');
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    SecureStore.getItemAsync(ANTHROPIC_KEY).then((key) => setApiKey(key || ''));
+  }, []);
+
+  const persistSettings = async (patch) => {
+    const next = { ...settings, ...patch };
+    setSettings(next);
+    await saveSettings(next);
+  };
+
+  const saveKey = async () => {
+    setSaving(true);
+    try {
+      if (apiKey.trim()) await SecureStore.setItemAsync(ANTHROPIC_KEY, apiKey.trim());
+      else await SecureStore.deleteItemAsync(ANTHROPIC_KEY);
+      Alert.alert('Saved', 'Settings updated.');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <ScrollView style={styles.screen} contentContainerStyle={styles.content}>
+      <Panel>
+        <Text style={styles.panelTitle}>Anthropic</Text>
+        <Field label="API key" value={apiKey} onChangeText={setApiKey} secureTextEntry placeholder="sk-ant-..." />
+        <Button label={saving ? 'Saving...' : 'Save key'} onPress={saveKey} disabled={saving} />
+      </Panel>
+      <Panel>
+        <Text style={styles.panelTitle}>Trading</Text>
+        <View style={styles.rowBetween}>
+          <Text style={styles.itemTitle}>Alpaca mode</Text>
+          <Pressable onPress={() => persistSettings({ alpacaMode: settings.alpacaMode === 'paper' ? 'live' : 'paper' })} style={styles.modeSwitch}>
+            <Text style={styles.modeText}>{settings.alpacaMode === 'paper' ? 'Paper' : 'Live'}</Text>
+          </Pressable>
+        </View>
+      </Panel>
+      <Panel>
+        <Text style={styles.panelTitle}>Notifications</Text>
+        <View style={styles.rowBetween}>
+          <Text style={styles.itemTitle}>Push alerts</Text>
+          <Switch
+            value={Boolean(settings.notifications)}
+            onValueChange={(value) => persistSettings({ notifications: value })}
+            thumbColor={settings.notifications ? '#2dd4bf' : '#94a3b8'}
+          />
+        </View>
+      </Panel>
+      <Panel>
+        <Text style={styles.panelTitle}>Legion</Text>
+        <Field
+          label="Health URL"
+          value={settings.legionHealthUrl}
+          onChangeText={(value) => persistSettings({ legionHealthUrl: value })}
+          placeholder={LEGION_HEALTH_DEFAULT}
+        />
+      </Panel>
+      <Button label="Logout" tone="danger" onPress={onLogout} />
+    </ScrollView>
+  );
+}
+
+export default function App() {
+  const [booting, setBooting] = useState(true);
+  const [token, setToken] = useState(null);
+  const [tab, setTab] = useState('home');
+  const [settings, setSettings] = useState({ alpacaMode: 'paper', notifications: true, legionHealthUrl: LEGION_HEALTH_DEFAULT });
+  const [claudePrompt, setClaudePrompt] = useState('');
+  const lastLegionOnline = useRef(null);
+  const api = useMemo(() => makeApi(token, settings), [token, settings]);
+
+  useEffect(() => {
+    (async () => {
+      const [storedToken, storedSettings] = await Promise.all([SecureStore.getItemAsync(AUTH_TOKEN_KEY), loadSettings()]);
+      setToken(storedToken);
+      setSettings(storedSettings);
+      setBooting(false);
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (!token || !settings.notifications) return;
+    (async () => {
+      const permission = await Notifications.requestPermissionsAsync();
+      if (!permission.granted) return;
+      const tokenResult = await Notifications.getExpoPushTokenAsync();
+      try {
+        await api.registerDevice(tokenResult.data);
+      } catch (err) {
+        console.warn('Device registration failed', err.message);
+      }
+    })();
+  }, [api, settings.notifications, token]);
+
+  useEffect(() => {
+    if (!token || !settings.notifications) return;
+    const timer = setInterval(async () => {
+      try {
+        await api.legionStatus();
+        lastLegionOnline.current = true;
+      } catch {
+        if (lastLegionOnline.current === true) {
+          await Notifications.scheduleNotificationAsync({
+            content: { title: 'Legion is offline', body: 'Legion went offline unexpectedly.', data: { screen: 'home' } },
+            trigger: null,
+          });
+        }
+        lastLegionOnline.current = false;
+      }
+    }, 30000);
+    return () => clearInterval(timer);
+  }, [api, settings.notifications, token]);
+
+  const shareToAgent = async (text) => {
+    await SecureStore.setItemAsync(SHARED_PROMPT_KEY, text);
+    setTab('agents');
+  };
+
+  const logout = async () => {
+    await SecureStore.deleteItemAsync(AUTH_TOKEN_KEY);
+    setToken(null);
+  };
+
+  if (booting) {
+    return (
+      <View style={styles.centerScreen}>
+        <StatusBar style="light" />
+        <ActivityIndicator color="#2dd4bf" />
+      </View>
+    );
+  }
+
+  if (!token) return <LoginScreen onLogin={setToken} />;
+
+  return (
+    <View style={styles.app}>
+      <StatusBar style="light" />
+      <View style={styles.header}>
+        <View>
+          <Text style={styles.headerTitle}>Sentinel Command</Text>
+          <Text style={styles.headerSub}>{SCOUT_URL.replace('https://', '')} - {LISTER_URL.replace('https://', '')}</Text>
+        </View>
+      </View>
+      <View style={styles.main}>
+        {tab === 'home' ? <HomeScreen api={api} token={token} settings={settings} /> : null}
+        {tab === 'invest' ? <InvestScreen api={api} /> : null}
+        {tab === 'agents' ? <AgentsScreen api={api} openClaudeTab={(prompt) => { setClaudePrompt(prompt); setTab('claude'); }} /> : null}
+        {tab === 'claude' ? <ClaudeScreen initialPrompt={claudePrompt} onShareToAgent={shareToAgent} /> : null}
+        {tab === 'settings' ? <SettingsScreen settings={settings} setSettings={setSettings} onLogout={logout} /> : null}
+      </View>
+      <View style={styles.tabBar}>
+        {TABS.map((item) => (
+          <Pressable key={item.id} onPress={() => setTab(item.id)} style={[styles.tabItem, tab === item.id && styles.tabActive]}>
+            <Text style={[styles.tabText, tab === item.id && styles.tabTextActive]} numberOfLines={1}>
+              {item.label}
+            </Text>
+          </Pressable>
+        ))}
+      </View>
+    </View>
+  );
+}
+
 const styles = StyleSheet.create({
-  root: {
-    flex: 1,
-    backgroundColor: BG,
+  app: { flex: 1, backgroundColor: '#06111f' },
+  centerScreen: { flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: '#06111f' },
+  loginRoot: { flex: 1, justifyContent: 'center', padding: 20, backgroundColor: '#06111f' },
+  loginBox: { gap: 14 },
+  brand: { color: '#f8fafc', fontSize: 34, fontWeight: '800', letterSpacing: 0 },
+  subhead: { color: '#94a3b8', fontSize: 15, marginBottom: 12 },
+  header: {
+    paddingTop: Platform.OS === 'ios' ? 58 : 34,
+    paddingHorizontal: 18,
+    paddingBottom: 14,
+    backgroundColor: '#071827',
+    borderBottomWidth: 1,
+    borderBottomColor: '#123041',
   },
-  terminalScroll: {
-    flex: 1,
+  headerTitle: { color: '#f8fafc', fontSize: 22, fontWeight: '800', letterSpacing: 0 },
+  headerSub: { color: '#5eead4', fontSize: 12, marginTop: 2 },
+  main: { flex: 1 },
+  screen: { flex: 1, backgroundColor: '#06111f' },
+  content: { padding: 14, gap: 12, paddingBottom: 26 },
+  contentTight: { paddingHorizontal: 14 },
+  panel: {
+    backgroundColor: '#0b1f31',
+    borderWidth: 1,
+    borderColor: '#16364a',
+    borderRadius: 8,
+    padding: 14,
+    gap: 10,
   },
-  terminalContent: {
-    paddingTop: 56,
+  panelTitle: { color: '#f8fafc', fontSize: 17, fontWeight: '800', letterSpacing: 0 },
+  rowBetween: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', gap: 12 },
+  flex: { flex: 1 },
+  alignEnd: { alignItems: 'flex-end', gap: 6 },
+  muted: { color: '#94a3b8', fontSize: 13, lineHeight: 19 },
+  timestamp: { color: '#64748b', fontSize: 12, marginTop: 3 },
+  label: { color: '#cbd5e1', fontSize: 13, fontWeight: '700', marginBottom: 6 },
+  fieldWrap: { gap: 6 },
+  input: {
+    minHeight: 48,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#1f475e',
+    backgroundColor: '#071827',
+    color: '#f8fafc',
     paddingHorizontal: 12,
-    paddingBottom: 24,
+    paddingVertical: 10,
+    fontSize: 15,
   },
-  terminalText: {
-    color: FG,
-    fontFamily: MONO_FONT,
-    fontSize: 14,
-    lineHeight: 20,
+  textarea: { minHeight: 130, textAlignVertical: 'top' },
+  button: {
+    minHeight: 44,
+    borderRadius: 8,
+    paddingHorizontal: 14,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
   },
-  hiddenInput: {
-    height: 44,
-    paddingHorizontal: 12,
-    color: FG,
-    backgroundColor: BG,
-    fontFamily: MONO_FONT,
-    fontSize: 14,
-  },
-  keyboardAccessory: {
+  button_primary: { backgroundColor: '#0f766e', borderColor: '#2dd4bf' },
+  button_secondary: { backgroundColor: '#123041', borderColor: '#2a5369' },
+  button_danger: { backgroundColor: '#7f1d1d', borderColor: '#ef4444' },
+  button_ghost: { backgroundColor: 'transparent', borderColor: '#25465a' },
+  buttonDisabled: { opacity: 0.45 },
+  pressed: { opacity: 0.75 },
+  buttonText: { color: '#f8fafc', fontWeight: '800', fontSize: 14 },
+  buttonTextGhost: { color: '#5eead4' },
+  smallButton: { minHeight: 36, paddingHorizontal: 10 },
+  retryButton: { alignSelf: 'flex-start' },
+  actions: { flexDirection: 'row', gap: 10, flexWrap: 'wrap' },
+  badge: { borderRadius: 999, paddingHorizontal: 9, paddingVertical: 5, alignSelf: 'flex-start', borderWidth: 1 },
+  badge_muted: { backgroundColor: '#122033', borderColor: '#334155' },
+  badge_success: { backgroundColor: '#064e3b', borderColor: '#2dd4bf' },
+  badge_danger: { backgroundColor: '#7f1d1d', borderColor: '#ef4444' },
+  badge_warning: { backgroundColor: '#78350f', borderColor: '#f59e0b' },
+  badgeText: { color: '#e2e8f0', fontSize: 12, fontWeight: '800' },
+  badgeTextDanger: { color: '#fecaca' },
+  statsGrid: { flexDirection: 'row', gap: 10 },
+  statCard: { flex: 1, minHeight: 92, justifyContent: 'center' },
+  statValue: { color: '#f8fafc', fontSize: 27, fontWeight: '900', letterSpacing: 0 },
+  negative: { color: '#fca5a5' },
+  listRow: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: '#123041' },
+  activityRow: { paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: '#123041' },
+  itemTitle: { color: '#e2e8f0', fontSize: 14, lineHeight: 20 },
+  errorPanel: { borderColor: '#ef4444' },
+  errorTitle: { color: '#fecaca', fontSize: 16, fontWeight: '800' },
+  errorText: { color: '#fca5a5', fontSize: 13 },
+  skeletonWrap: { gap: 12 },
+  skeleton: { height: 52, borderRadius: 8, backgroundColor: '#10283a', borderWidth: 1, borderColor: '#17384c' },
+  segment: { flexDirection: 'row', gap: 8, padding: 14, paddingBottom: 4 },
+  segmentItem: { flex: 1, minHeight: 42, justifyContent: 'center', alignItems: 'center', borderRadius: 8, backgroundColor: '#0b1f31', borderWidth: 1, borderColor: '#16364a' },
+  segmentActive: { backgroundColor: '#0f766e', borderColor: '#2dd4bf' },
+  segmentText: { color: '#f8fafc', fontWeight: '800' },
+  signalCard: { backgroundColor: '#0b1f31', borderWidth: 1, borderColor: '#16364a', borderRadius: 8, padding: 14, marginBottom: 10 },
+  signalTicker: { color: '#f8fafc', fontSize: 22, fontWeight: '900', letterSpacing: 0 },
+  modalShade: { flex: 1, backgroundColor: 'rgba(0,0,0,0.72)', justifyContent: 'flex-end' },
+  modalSheet: { maxHeight: '92%', backgroundColor: '#06111f', borderTopLeftRadius: 14, borderTopRightRadius: 14, padding: 14, gap: 12, borderWidth: 1, borderColor: '#16364a' },
+  modalTitle: { color: '#f8fafc', fontSize: 21, fontWeight: '900', letterSpacing: 0 },
+  newsRow: { gap: 8, paddingVertical: 8 },
+  bullet: { color: '#e2e8f0', fontSize: 14, lineHeight: 21 },
+  chips: { marginBottom: 10 },
+  chipRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 8 },
+  chip: { borderRadius: 8, borderWidth: 1, borderColor: '#25465a', paddingHorizontal: 11, paddingVertical: 8, marginRight: 8, backgroundColor: '#071827' },
+  chipActive: { backgroundColor: '#0f766e', borderColor: '#2dd4bf' },
+  chipText: { color: '#f8fafc', fontWeight: '700' },
+  logBox: { maxHeight: 360, backgroundColor: '#020617', borderRadius: 8, padding: 12, borderWidth: 1, borderColor: '#1e293b' },
+  logText: { color: '#cbd5e1', fontFamily: Platform.select({ ios: 'Courier New', android: 'monospace' }), fontSize: 12, lineHeight: 18 },
+  chatContent: { padding: 14, gap: 12, paddingBottom: 20 },
+  message: { borderRadius: 8, borderWidth: 1, padding: 12, gap: 8 },
+  messageUser: { backgroundColor: '#10283a', borderColor: '#27526b' },
+  messageAssistant: { backgroundColor: '#0b1f31', borderColor: '#2dd4bf' },
+  messageRole: { color: '#5eead4', fontSize: 12, fontWeight: '900' },
+  messageText: { color: '#f8fafc', fontSize: 15, lineHeight: 22 },
+  shareButton: { alignSelf: 'flex-start' },
+  composer: { borderTopWidth: 1, borderTopColor: '#123041', padding: 10, backgroundColor: '#071827', flexDirection: 'row', alignItems: 'flex-end', gap: 8 },
+  composerInput: { flex: 1, minHeight: 44, maxHeight: 110, color: '#f8fafc', backgroundColor: '#06111f', borderRadius: 8, borderWidth: 1, borderColor: '#1f475e', paddingHorizontal: 10, paddingVertical: 9 },
+  composerButton: { width: 72, minHeight: 44, paddingHorizontal: 6 },
+  modeSwitch: { minWidth: 92, minHeight: 40, justifyContent: 'center', alignItems: 'center', borderRadius: 8, borderWidth: 1, borderColor: '#2dd4bf', backgroundColor: '#0f766e' },
+  modeText: { color: '#f8fafc', fontWeight: '900' },
+  tabBar: {
     flexDirection: 'row',
-    justifyContent: 'flex-end',
-    backgroundColor: '#1c1c1e',
+    paddingHorizontal: 8,
+    paddingTop: 8,
+    paddingBottom: Platform.OS === 'ios' ? 24 : 10,
+    backgroundColor: '#071827',
     borderTopWidth: 1,
-    borderTopColor: '#3a3a3c',
-    paddingHorizontal: 12,
-    paddingVertical: 8,
+    borderTopColor: '#123041',
   },
-  keyboardDoneButton: {
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-  },
-  keyboardDoneText: {
-    color: '#0a84ff',
-    fontSize: 17,
-    fontWeight: '600',
-  },
+  tabItem: { flex: 1, minHeight: 42, alignItems: 'center', justifyContent: 'center', borderRadius: 8 },
+  tabActive: { backgroundColor: '#0b2b3f' },
+  tabText: { color: '#94a3b8', fontSize: 12, fontWeight: '800' },
+  tabTextActive: { color: '#5eead4' },
 });

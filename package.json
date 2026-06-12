@@ -1,5 +1,5 @@
 {
-  "name": "forgelite",
+  "name": "sentinel-command",
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
@@ -7,19 +7,16 @@
     "android": "expo run:android",
     "ios": "expo run:ios",
     "web": "expo start --web",
-    "postinstall": "patch-package"
+    "export": "expo export"
   },
   "dependencies": {
-    "@dylankenneally/react-native-ssh-sftp": "^1.7.0",
-    "@react-native-async-storage/async-storage": "2.2.0",
-    "expo": "~54.0.33",
-    "expo-dev-client": "~6.0.21",
+    "expo": "~54.0.35",
+    "expo-notifications": "0.32.17",
+    "expo-secure-store": "~15.0.8",
+    "expo-speech": "~14.0.8",
     "expo-status-bar": "~3.0.9",
     "react": "19.1.0",
     "react-native": "0.81.5"
   },
-  "private": true,
-  "devDependencies": {
-    "patch-package": "^8.0.1"
-  }
+  "private": true
 }

@@ -1,7 +1,7 @@
 {
   "expo": {
-    "name": "Forge Lite",
-    "slug": "forge-lite",
+    "name": "Sentinel Command",
+    "slug": "sentinel-command",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
@@ -9,15 +9,22 @@
     "splash": {
       "image": "./assets/splash-icon.png",
       "resizeMode": "contain",
-      "backgroundColor": "#000000"
+      "backgroundColor": "#06111f"
     },
     "ios": {
-      "bundleIdentifier": "org.sentinelprime.forgelite",
+      "bundleIdentifier": "org.sentinelprime.command",
       "supportsTablet": true,
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false
       }
     },
+    "android": {
+      "package": "org.sentinelprime.command"
+    },
+    "plugins": [
+      "expo-secure-store",
+      "expo-notifications"
+    ],
     "extra": {
       "eas": {
         "projectId": "9db21156-af7a-4e64-9764-1af5764ed8e3"
