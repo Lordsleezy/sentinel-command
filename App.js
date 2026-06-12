@@ -242,11 +242,12 @@ Input: "fix the Shift updater bug" → {"action":"launch_agent","params":{"descr
 
 async function loadSettings() {
   const raw = await safeStore.getItemAsync(SETTINGS_KEY);
-  if (!raw) return { alpacaMode: 'paper', notifications: true, legionHealthUrl: LEGION_HEALTH_DEFAULT };
+  const defaults = { alpacaMode: 'paper', notifications: true, legionHealthUrl: LEGION_HEALTH_DEFAULT, aiProvider: 'ollama' };
+  if (!raw) return defaults;
   try {
-    return { alpacaMode: 'paper', notifications: true, legionHealthUrl: LEGION_HEALTH_DEFAULT, ...JSON.parse(raw) };
+    return { ...defaults, ...JSON.parse(raw) };
   } catch {
-    return { alpacaMode: 'paper', notifications: true, legionHealthUrl: LEGION_HEALTH_DEFAULT };
+    return defaults;
   }
 }
 
@@ -557,7 +558,7 @@ function HomeScreen({ api, token, settings }) {
         <Text style={styles.panelTitle}>Business Pulse</Text>
         {mrrData && mrrData.total_mrr > 0 ? (
           <>
-            <View style={styles.rowBetween} style={{ marginTop: 8 }}>
+            <View style={[styles.rowBetween, { marginTop: 8 }]}>
               <Text style={[styles.statValue, { fontSize: 32 }]}>
                 ${Math.round(mrrData.total_mrr).toLocaleString()}
               </Text>
@@ -973,11 +974,12 @@ function AgentsScreen({ api, openClaudeTab }) {
   );
 }
 
-function ClaudeScreen({ initialPrompt = '', onShareToAgent }) {
+function ClaudeScreen({ initialPrompt = '', onShareToAgent, settings }) {
   const [apiKey, setApiKey] = useState('');
   const [input, setInput] = useState(initialPrompt);
   const [messages, setMessages] = useState([]);
   const [loading, setLoading] = useState(false);
+  const useAnthropic = settings?.aiProvider === 'anthropic';
 
   useEffect(() => {
     safeStore.getItemAsync(ANTHROPIC_KEY).then((key) => setApiKey(key || ''));
@@ -987,39 +989,76 @@ function ClaudeScreen({ initialPrompt = '', onShareToAgent }) {
     if (initialPrompt) setInput(initialPrompt);
   }, [initialPrompt]);
 
+  const sendViaOllama = async (nextMessages) => {
+    const prompt = nextMessages[nextMessages.length - 1]?.content || '';
+    const history = nextMessages.slice(0, -1).map(m => `${m.role}: ${m.content}`).join('\n');
+    const fullPrompt = history ? `${history}\nuser: ${prompt}` : prompt;
+
+    const res = await fetch(LEGION_OLLAMA_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'mistral',
+        system: SYSTEM_PROMPT,
+        prompt: fullPrompt,
+        stream: false,
+      }),
+      signal: AbortSignal.timeout(30000),
+    });
+
+    if (!res.ok) throw new Error('Legion/Ollama offline');
+    const data = await res.json();
+    return data.response || data.message?.content || 'No response from model';
+  };
+
+  const sendViaAnthropic = async (nextMessages) => {
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+        'anthropic-dangerous-direct-browser-access': 'true',
+      },
+      body: JSON.stringify({
+        model: CLAUDE_MODEL,
+        max_tokens: 1200,
+        system: SYSTEM_PROMPT,
+        messages: nextMessages.map((message) => ({ role: message.role, content: message.content })),
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data?.error?.message || `${res.status} ${res.statusText}`);
+    return data?.content?.map((part) => part.text).filter(Boolean).join('\n') || '';
+  };
+
   const send = async () => {
     if (!input.trim()) return;
-    if (!apiKey) {
-      Alert.alert('Anthropic key required', 'Add your Anthropic API key in Settings first.');
+
+    if (useAnthropic && !apiKey) {
+      Alert.alert('Anthropic key required', 'Add your Anthropic API key in Settings first, or switch to Ollama (free).');
       return;
     }
+
     const userMessage = { role: 'user', content: input.trim() };
     const next = [...messages, userMessage];
     setMessages(next);
     setInput('');
     setLoading(true);
+
     try {
-      const res = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': apiKey,
-          'anthropic-version': '2023-06-01',
-          'anthropic-dangerous-direct-browser-access': 'true',
-        },
-        body: JSON.stringify({
-          model: CLAUDE_MODEL,
-          max_tokens: 1200,
-          system: SYSTEM_PROMPT,
-          messages: next.map((message) => ({ role: message.role, content: message.content })),
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data?.error?.message || `${res.status} ${res.statusText}`);
-      const text = data?.content?.map((part) => part.text).filter(Boolean).join('\n') || '';
+      let text;
+      if (useAnthropic) {
+        text = await sendViaAnthropic(next);
+      } else {
+        text = await sendViaOllama(next);
+      }
       setMessages([...next, { role: 'assistant', content: text }]);
     } catch (err) {
-      setMessages([...next, { role: 'assistant', content: `Claude request failed: ${err.message}` }]);
+      const errorMsg = useAnthropic
+        ? `Claude request failed: ${err.message}`
+        : `Ollama request failed: ${err.message}. Switch to Anthropic in Settings for alternative.`;
+      setMessages([...next, { role: 'assistant', content: errorMsg }]);
     } finally {
       setLoading(false);
     }
@@ -1095,10 +1134,29 @@ function SettingsScreen({ settings, setSettings, onLogout }) {
   return (
     <ScrollView style={styles.screen} contentContainerStyle={styles.content}>
       <Panel>
-        <Text style={styles.panelTitle}>Anthropic</Text>
-        <Field label="API key" value={apiKey} onChangeText={setApiKey} secureTextEntry placeholder="sk-ant-..." />
-        <Button label={saving ? 'Saving...' : 'Save key'} onPress={saveKey} disabled={saving} />
+        <Text style={styles.panelTitle}>AI Provider</Text>
+        <View style={styles.rowBetween}>
+          <Text style={styles.itemTitle}>Chat provider</Text>
+          <Pressable
+            onPress={() => persistSettings({ aiProvider: settings.aiProvider === 'ollama' ? 'anthropic' : 'ollama' })}
+            style={styles.modeSwitch}>
+            <Text style={styles.modeText}>{settings.aiProvider === 'ollama' ? 'Ollama (Free)' : 'Anthropic'}</Text>
+          </Pressable>
+        </View>
+        <Text style={[styles.muted, { marginTop: 8 }]}>
+          {settings.aiProvider === 'ollama'
+            ? 'Using Mistral on Legion (free, local inference). Requires Legion to be online.'
+            : 'Using Claude via Anthropic API (paid, requires your own API key).'}
+        </Text>
       </Panel>
+
+      {settings.aiProvider === 'anthropic' && (
+        <Panel>
+          <Text style={styles.panelTitle}>Anthropic API Key</Text>
+          <Field label="API key" value={apiKey} onChangeText={setApiKey} secureTextEntry placeholder="sk-ant-..." />
+          <Button label={saving ? 'Saving...' : 'Save key'} onPress={saveKey} disabled={saving} />
+        </Panel>
+      )}
       <Panel>
         <Text style={styles.panelTitle}>Trading</Text>
         <View style={styles.rowBetween}>
@@ -1308,7 +1366,7 @@ export default function App() {
         {tab === 'home' ? <HomeScreen api={api} token={token} settings={settings} /> : null}
         {tab === 'invest' ? <InvestScreen api={api} /> : null}
         {tab === 'agents' ? <AgentsScreen api={api} openClaudeTab={(prompt) => { setClaudePrompt(prompt); setTab('claude'); }} /> : null}
-        {tab === 'claude' ? <ClaudeScreen initialPrompt={claudePrompt} onShareToAgent={shareToAgent} /> : null}
+        {tab === 'claude' ? <ClaudeScreen initialPrompt={claudePrompt} onShareToAgent={shareToAgent} settings={settings} /> : null}
         {tab === 'settings' ? <SettingsScreen settings={settings} setSettings={setSettings} onLogout={logout} /> : null}
       </View>
 
