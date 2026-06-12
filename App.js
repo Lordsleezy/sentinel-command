@@ -24,6 +24,7 @@ const DASHBOARD_API_DEFAULT = 'https://dashboard.sentinelprime.org/api';
 const SCOUT_URL = 'https://scout.sentinelprime.org';
 const LISTER_URL = 'https://lister.sentinelprime.org';
 const INVEST_URL = 'https://invest.sentinelprime.org';
+const OPENCLAW_URL = 'https://openclaw.sentinelprime.org';
 const LEGION_HEALTH_DEFAULT = 'http://192.168.0.117:8001/health';
 const CLAUDE_MODEL = 'claude-sonnet-4-20250514';
 const AUTH_TOKEN_KEY = 'sentinel_command_session_token';
@@ -303,6 +304,12 @@ function makeApi(token, settings) {
       }),
     agentLogs: (id) => request(`${DASHBOARD_API_DEFAULT}/agents/${id}/logs`),
     mrrSummary: () => request(`${DASHBOARD_API_DEFAULT}/billing/mrr-summary`),
+    openClawHistory: (session) => request(`${OPENCLAW_URL}/chat/history?session=${encodeURIComponent(session)}`),
+    openClawMessage: (session, message) =>
+      request(`${OPENCLAW_URL}/chat/message`, {
+        method: 'POST',
+        body: JSON.stringify({ session, message }),
+      }),
     stats: () => request(`${DASHBOARD_API_DEFAULT}/stats`),
     activity: () => request(`${DASHBOARD_API_DEFAULT}/activity?limit=10`),
     signals: () => request(`${INVEST_URL}/signals`),
@@ -841,135 +848,160 @@ function TradeBriefing({ signal, news, onClose, onApprove }) {
   );
 }
 
-function AgentsScreen({ api, openClaudeTab }) {
-  const [repos, setRepos] = useState([]);
-  const [repo, setRepo] = useState('');
-  const [agent, setAgent] = useState('Codex');
-  const [prompt, setPrompt] = useState('');
-  const [agents, setAgents] = useState([]);
-  const [detail, setDetail] = useState(null);
-  const [logs, setLogs] = useState('');
+function AgentsScreen({ api }) {
+  const [session, setSession] = useState('chat');
+  const [messages, setMessages] = useState([]);
+  const [draft, setDraft] = useState('');
   const [loading, setLoading] = useState(true);
+  const [sending, setSending] = useState(false);
+  const [offline, setOffline] = useState(false);
+  const [error, setError] = useState('');
 
-  const load = useCallback(async () => {
+  const loadHistory = useCallback(async () => {
+    setLoading(true);
+    setError('');
     try {
-      const [reposData, agentsData] = await Promise.allSettled([api.githubRepos(), api.activeAgents()]);
-      if (reposData.status === 'fulfilled') {
-        const names = normalizeList(reposData.value).map((item) => item.name).filter(Boolean);
-        setRepos(names);
-        if (!repo && names.length) setRepo(names[0]);
-      }
-      setAgents(agentsData.status === 'fulfilled' ? normalizeList(agentsData.value, ['agents', 'jobs']) : fallbackAgents);
+      const data = await api.openClawHistory(session);
+      const rows = normalizeList(data, ['history']).flatMap((item, index) => [
+        {
+          id: `${item.id || index}-user`,
+          role: 'user',
+          content: item.message || '',
+          time: item.created_at,
+        },
+        {
+          id: `${item.id || index}-assistant`,
+          role: 'assistant',
+          content: item.response || '',
+          time: item.created_at,
+        },
+      ]).filter((item) => item.content);
+      setMessages(rows);
+      setOffline(false);
+    } catch (err) {
+      setOffline(true);
+      setError(err.message || 'OpenClaw is unavailable.');
     } finally {
       setLoading(false);
     }
-  }, [api, repo]);
+  }, [api, session]);
 
   useEffect(() => {
-    load();
-    const timer = setInterval(load, 30000);
-    return () => clearInterval(timer);
-  }, [load]);
+    loadHistory();
+  }, [loadHistory]);
 
   useEffect(() => {
     const timer = setInterval(async () => {
       const shared = await safeStore.getItemAsync(SHARED_PROMPT_KEY);
       if (shared) {
-        setPrompt(shared);
+        setDraft(shared);
         await safeStore.deleteItemAsync(SHARED_PROMPT_KEY);
       }
     }, 1000);
     return () => clearInterval(timer);
   }, []);
 
-  const launch = async () => {
+  const wakeLegion = async () => {
     try {
-      await api.launchAgent({ repo, agent, prompt, legion: { host: '192.168.0.117', user: 'pgg12' } });
-      setPrompt('');
-      await load();
+      await api.wakeLegion();
+      Alert.alert('Wake sent', 'Legion wake request was sent.');
     } catch (err) {
-      Alert.alert('Launch failed', err.message);
+      Alert.alert('Wake failed', err.message);
     }
   };
 
-  const openDetail = async (item) => {
-    setDetail(item);
-    setLogs('Loading logs...');
+  const send = async () => {
+    const text = draft.trim();
+    if (!text || sending) return;
+    const userMessage = { id: `user-${Date.now()}`, role: 'user', content: text, time: Date.now() / 1000 };
+    setMessages((current) => [...current, userMessage]);
+    setDraft('');
+    setSending(true);
+    setError('');
     try {
-      const data = await api.agentLogs(item.id || item.jobId);
-      setLogs(data?.logs || data?.text || JSON.stringify(data, null, 2));
+      const data = await api.openClawMessage(session, text);
+      setMessages((current) => [
+        ...current,
+        {
+          id: `assistant-${Date.now()}`,
+          role: 'assistant',
+          content: data?.response || data?.text || 'No response returned.',
+          time: Date.now() / 1000,
+        },
+      ]);
+      setOffline(false);
     } catch (err) {
-      setLogs(err.message);
+      setOffline(true);
+      setError(err.message || 'OpenClaw is unavailable.');
+    } finally {
+      setSending(false);
     }
   };
 
   return (
-    <ScrollView style={styles.screen} contentContainerStyle={styles.content}>
-      <Panel>
-        <Text style={styles.panelTitle}>Launch Agent</Text>
-        <Text style={styles.label}>Repo</Text>
-        <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.chips}>
-          {(repos.length ? repos : ['sentinel-command']).map((name) => (
-            <Pressable key={name} onPress={() => setRepo(name)} style={[styles.chip, repo === name && styles.chipActive]}>
-              <Text style={styles.chipText}>{name}</Text>
-            </Pressable>
-          ))}
-        </ScrollView>
-        <Text style={styles.label}>Agent</Text>
-        <View style={styles.chipRow}>
-          {['Codex', 'Cursor', 'Cline'].map((name) => (
-            <Pressable key={name} onPress={() => setAgent(name)} style={[styles.chip, agent === name && styles.chipActive]}>
-              <Text style={styles.chipText}>{name}</Text>
-            </Pressable>
-          ))}
-        </View>
-        <Field label="Prompt" value={prompt} onChangeText={setPrompt} multiline placeholder="Describe the job for the selected agent." />
-        <View style={styles.actions}>
-          <Button label="Get Prompt from Claude" onPress={() => openClaudeTab(prompt)} tone="secondary" />
-          <Button label="Launch" onPress={launch} disabled={!repo || !prompt.trim()} />
-        </View>
-      </Panel>
+    <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={styles.chatScreen}>
+      <View style={styles.segment}>
+        {[
+          { id: 'chat', label: 'Chat' },
+          { id: 'codex', label: 'Codex' },
+        ].map((item) => (
+          <Pressable key={item.id} onPress={() => setSession(item.id)} style={[styles.segmentItem, session === item.id && styles.segmentActive]}>
+            <Text style={styles.segmentText}>{item.label}</Text>
+          </Pressable>
+        ))}
+      </View>
 
-      <Panel>
-        <View style={styles.rowBetween}>
-          <Text style={styles.panelTitle}>Active agents</Text>
-          {loading ? <ActivityIndicator color="#2dd4bf" /> : null}
-        </View>
+      {offline ? (
+        <Panel style={styles.offlinePanel}>
+          <Text style={styles.errorTitle}>Legion is offline</Text>
+          <Text style={styles.errorText}>{error || 'OpenClaw is unreachable. Wake Legion first, then retry.'}</Text>
+          <View style={styles.actions}>
+            <Button label="Wake" onPress={wakeLegion} />
+            <Button label="Retry" onPress={loadHistory} tone="secondary" />
+          </View>
+        </Panel>
+      ) : null}
+
+      {loading ? (
+        <ScrollView style={styles.screen} contentContainerStyle={styles.content}>
+          <Skeleton rows={6} />
+        </ScrollView>
+      ) : (
         <FlatList
-          data={agents}
-          keyExtractor={(item, index) => String(item.id || item.jobId || index)}
-          scrollEnabled={false}
-          ListEmptyComponent={<Text style={styles.muted}>No active agents.</Text>}
+          style={styles.chatList}
+          contentContainerStyle={styles.chatContent}
+          data={messages}
+          keyExtractor={(item) => item.id}
+          ListEmptyComponent={<Text style={styles.muted}>No messages yet.</Text>}
           renderItem={({ item }) => (
-            <Pressable onPress={() => openDetail(item)} style={styles.listRow}>
-              <View style={styles.flex}>
-                <Text style={styles.itemTitle}>{item.agent || item.name || 'Agent'} on {item.repo || 'repo'}</Text>
-                <Text style={styles.muted}>{item.status || 'unknown'} - {compactTime(item.startedAt || item.started_at)}</Text>
-              </View>
-              <Badge>{item.status || 'live'}</Badge>
-            </Pressable>
+            <View style={[styles.messageBubble, item.role === 'user' ? styles.messageBubbleUser : styles.messageBubbleAssistant]}>
+              <Text style={styles.messageRole}>{item.role === 'user' ? 'Paul' : session === 'codex' ? 'Codex' : 'ChatGPT'}</Text>
+              <Text style={styles.messageText}>{item.content}</Text>
+              {item.time ? <Text style={styles.timestamp}>{compactTime(item.time * 1000)}</Text> : null}
+            </View>
           )}
         />
-      </Panel>
+      )}
 
-      <Modal visible={Boolean(detail)} animationType="slide" transparent>
-        <View style={styles.modalShade}>
-          <View style={styles.modalSheet}>
-            <View style={styles.rowBetween}>
-              <Text style={styles.modalTitle}>{detail?.agent || detail?.name || 'Agent'} Logs</Text>
-              <Button label="Close" onPress={() => setDetail(null)} tone="ghost" style={styles.smallButton} />
-            </View>
-            <ScrollView style={styles.logBox}>
-              <Text style={styles.logText}>{logs}</Text>
-            </ScrollView>
-            <View style={styles.actions}>
-              <Button label="Stop" tone="danger" onPress={() => api.stopAgent(detail?.id || detail?.jobId).then(() => { setDetail(null); load(); })} />
-              <Button label="Redirect prompt" tone="secondary" onPress={() => { setPrompt(`Continue this job with the following context:\n\n${logs}`); setDetail(null); }} />
-            </View>
-          </View>
+      {sending ? (
+        <View style={styles.typingRow}>
+          <ActivityIndicator color="#2dd4bf" />
+          <Text style={styles.muted}>{session === 'codex' ? 'Codex' : 'ChatGPT'} is typing...</Text>
         </View>
-      </Modal>
-    </ScrollView>
+      ) : null}
+
+      <View style={styles.composer}>
+        <TextInput
+          value={draft}
+          onChangeText={setDraft}
+          placeholder={`Message ${session === 'codex' ? 'Codex' : 'ChatGPT'}`}
+          placeholderTextColor="#64748b"
+          multiline
+          style={styles.composerInput}
+        />
+        <Button label="Send" onPress={send} disabled={!draft.trim() || sending} style={styles.composerButton} />
+      </View>
+    </KeyboardAvoidingView>
   );
 }
 
@@ -1445,12 +1477,19 @@ const styles = StyleSheet.create({
   chipText: { color: '#f8fafc', fontWeight: '700' },
   logBox: { maxHeight: 360, backgroundColor: '#020617', borderRadius: 8, padding: 12, borderWidth: 1, borderColor: '#1e293b' },
   logText: { color: '#cbd5e1', fontFamily: Platform.select({ ios: 'Courier New', android: 'monospace' }), fontSize: 12, lineHeight: 18 },
+  chatScreen: { flex: 1, backgroundColor: '#06111f' },
+  chatList: { flex: 1, backgroundColor: '#06111f' },
+  offlinePanel: { marginHorizontal: 14, marginTop: 10, borderColor: '#ef4444' },
   chatContent: { padding: 14, gap: 12, paddingBottom: 20 },
+  messageBubble: { maxWidth: '88%', borderRadius: 8, borderWidth: 1, padding: 12, gap: 6 },
+  messageBubbleUser: { alignSelf: 'flex-end', backgroundColor: '#0f766e', borderColor: '#2dd4bf' },
+  messageBubbleAssistant: { alignSelf: 'flex-start', backgroundColor: '#0b1f31', borderColor: '#16364a' },
   message: { borderRadius: 8, borderWidth: 1, padding: 12, gap: 8 },
   messageUser: { backgroundColor: '#10283a', borderColor: '#27526b' },
   messageAssistant: { backgroundColor: '#0b1f31', borderColor: '#2dd4bf' },
   messageRole: { color: '#5eead4', fontSize: 12, fontWeight: '900' },
   messageText: { color: '#f8fafc', fontSize: 15, lineHeight: 22 },
+  typingRow: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingHorizontal: 14, paddingVertical: 8, backgroundColor: '#06111f' },
   shareButton: { alignSelf: 'flex-start' },
   composer: { borderTopWidth: 1, borderTopColor: '#123041', padding: 10, backgroundColor: '#071827', flexDirection: 'row', alignItems: 'flex-end', gap: 8 },
   composerInput: { flex: 1, minHeight: 44, maxHeight: 110, color: '#f8fafc', backgroundColor: '#06111f', borderRadius: 8, borderWidth: 1, borderColor: '#1f475e', paddingHorizontal: 10, paddingVertical: 9 },
