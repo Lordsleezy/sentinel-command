@@ -30,6 +30,8 @@ const AUTH_TOKEN_KEY = 'sentinel_command_session_token';
 const ANTHROPIC_KEY = 'sentinel_command_anthropic_key';
 const SETTINGS_KEY = 'sentinel_command_settings';
 const SHARED_PROMPT_KEY = 'sentinel_command_shared_prompt';
+const LEGION_OLLAMA_URL = 'https://legion.sentinelprime.org/ollama/api/generate';
+const LAST_SEEN_KEY = 'sentinel_command_last_seen';
 
 const safeStore = {
   async getItemAsync(key) {
@@ -137,6 +139,107 @@ function normalizeList(payload, keys = []) {
   return [];
 }
 
+// Utility: Format relative time (Vercel-style freshness)
+function formatRelativeTime(date) {
+  if (!date) return 'never';
+  const target = new Date(date);
+  const now = new Date();
+  const diffMs = now.getTime() - target.getTime();
+  const diffSec = Math.floor(diffMs / 1000);
+  const diffMin = Math.floor(diffSec / 60);
+  const diffHour = Math.floor(diffMin / 60);
+  const diffDay = Math.floor(diffHour / 24);
+
+  if (diffSec < 30) return 'just now';
+  if (diffMin < 1) return `${diffSec}s ago`;
+  if (diffMin < 60) return `${diffMin}m ago`;
+  if (diffHour < 24) return `${diffHour}h ago`;
+  if (diffDay < 30) return `${diffDay}d ago`;
+  return `${Math.floor(diffDay / 30)}mo ago`;
+}
+
+// Utility: Format duration for running jobs
+function formatDuration(startTime) {
+  const start = new Date(startTime);
+  const now = new Date();
+  const diffMin = Math.floor((now.getTime() - start.getTime()) / 1000 / 60);
+  const diffHour = Math.floor(diffMin / 60);
+  if (diffHour > 0) return `Running ${diffHour}h ${diffMin % 60}m`;
+  return `Running ${diffMin}m`;
+}
+
+// Intent routing via Ollama (Mistral)
+async function sendIntentToOllama(input, api, settings) {
+  const systemPrompt = `You are a command router for Sentinel Command. Given the user's input, respond ONLY with JSON in this exact format:
+{
+  "action": "wake_legion" | "shutdown_legion" | "open_invest" | "approve_trade" | "launch_agent" | "open_chat" | "show_mrr" | "unknown",
+  "params": { ... },
+  "response": "friendly response text for user (optional)"
+}
+
+Extract any relevant parameters:
+- For approve_trade: extract "ticker" symbol (e.g., NVDA, TSLA)
+- For launch_agent: extract "description" or "bug" details
+- For show_mrr: no params needed
+
+Examples:
+Input: "wake legion" → {"action":"wake_legion","params":{}}
+Input: "approve the NVDA trade" → {"action":"approve_trade","params":{"ticker":"NVDA"}}
+Input: "what's my MRR" → {"action":"show_mrr","params":{}}
+Input: "fix the Shift updater bug" → {"action":"launch_agent","params":{"description":"fix the Shift updater bug"}}`;
+
+  try {
+    // First check if Legion is online
+    try {
+      await api.legionStatus();
+    } catch {
+      return { action: 'legion_offline', params: {}, response: 'Legion is offline — wake it first' };
+    }
+
+    const res = await fetch(LEGION_OLLAMA_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'mistral',
+        system: systemPrompt,
+        prompt: input,
+        stream: false,
+        format: 'json',
+      }),
+      signal: AbortSignal.timeout(5000),
+    });
+
+    if (!res.ok) throw new Error('Ollama request failed');
+
+    const data = await res.json();
+    let parsed;
+    try {
+      parsed = JSON.parse(data.response || data.message?.content || '{}');
+    } catch {
+      const jsonMatch = (data.response || '').match(/\{[\s\S]*\}/);
+      parsed = jsonMatch ? JSON.parse(jsonMatch[0]) : { action: 'unknown', params: {} };
+    }
+
+    const validActions = ['wake_legion', 'shutdown_legion', 'open_invest', 'approve_trade', 'launch_agent', 'open_chat', 'show_mrr', 'unknown'];
+    if (!validActions.includes(parsed.action)) parsed.action = 'unknown';
+
+    // Map actions to navigation targets
+    const navigationMap = {
+      show_mrr: 'home',
+      open_invest: 'invest',
+      approve_trade: 'invest',
+      launch_agent: 'agents',
+      open_chat: 'claude',
+      unknown: 'claude',
+    };
+
+    return { ...parsed, navigateTo: navigationMap[parsed.action] };
+  } catch (error) {
+    console.warn('Intent routing failed:', error);
+    return { action: 'open_chat', params: { originalInput: input }, navigateTo: 'claude' };
+  }
+}
+
 async function loadSettings() {
   const raw = await safeStore.getItemAsync(SETTINGS_KEY);
   if (!raw) return { alpacaMode: 'paper', notifications: true, legionHealthUrl: LEGION_HEALTH_DEFAULT };
@@ -199,6 +302,7 @@ function makeApi(token, settings) {
         body: JSON.stringify(payload),
       }),
     agentLogs: (id) => request(`${DASHBOARD_API_DEFAULT}/agents/${id}/logs`),
+    mrrSummary: () => request(`${DASHBOARD_API_DEFAULT}/billing/mrr-summary`),
     stats: () => request(`${DASHBOARD_API_DEFAULT}/stats`),
     activity: () => request(`${DASHBOARD_API_DEFAULT}/activity?limit=10`),
     signals: () => request(`${INVEST_URL}/signals`),
@@ -324,24 +428,37 @@ function HomeScreen({ api, token, settings }) {
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState('');
   const [legion, setLegion] = useState({ online: false });
+  const [legionLastSeen, setLegionLastSeen] = useState(null);
   const [agents, setAgents] = useState([]);
   const [stats, setStats] = useState({});
   const [activity, setActivity] = useState([]);
+  const [mrrData, setMrrData] = useState(null);
 
   const load = useCallback(async () => {
     setError('');
     try {
-      const [legionResult, overviewResult] = await Promise.allSettled([
+      const [legionResult, overviewResult, mrrResult] = await Promise.allSettled([
         api.legionStatus(),
         api.overview(),
+        api.mrrSummary(),
       ]);
-      setLegion(
-        legionResult.status === 'fulfilled'
-          ? { online: true, ...(legionResult.value || {}) }
-          : overviewResult.status === 'fulfilled' && overviewResult.value?.legion
-            ? { online: Boolean(overviewResult.value.legion.ok), ...(overviewResult.value.legion || {}) }
-          : { online: false, error: legionResult.reason?.message },
-      );
+
+      // Handle Legion status with last seen tracking
+      const isOnline = legionResult.status === 'fulfilled' ||
+        (overviewResult.status === 'fulfilled' && overviewResult.value?.legion?.ok);
+      setLegion({
+        online: isOnline,
+        ...(legionResult.value || {}),
+        ...(overviewResult.value?.legion || {}),
+      });
+      if (isOnline) {
+        setLegionLastSeen(new Date().toISOString());
+        await safeStore.setItemAsync(LAST_SEEN_KEY, new Date().toISOString());
+      } else {
+        const stored = await safeStore.getItemAsync(LAST_SEEN_KEY);
+        if (stored) setLegionLastSeen(stored);
+      }
+
       setAgents(fallbackAgents);
       setStats(
         overviewResult.status === 'fulfilled'
@@ -362,6 +479,14 @@ function HomeScreen({ api, token, settings }) {
             }))
           : fallbackActivity,
       );
+
+      // Set MRR data (gracefully handles missing/empty)
+      if (mrrResult.status === 'fulfilled') {
+        setMrrData(mrrResult.value);
+      } else {
+        setMrrData({ total_mrr: 0, new_mrr: 0, churned_mrr: 0, net_change: 0, subscriber_count: 0, currency: 'usd' });
+      }
+
       if (legionResult.status === 'rejected' && overviewResult.status === 'rejected') {
         setError(legionResult.reason?.message || overviewResult.reason?.message || 'Overview failed.');
       }
@@ -411,7 +536,13 @@ function HomeScreen({ api, token, settings }) {
         <View style={styles.rowBetween}>
           <View>
             <Text style={styles.panelTitle}>Legion</Text>
-            <Text style={styles.muted}>{settings.legionHealthUrl || LEGION_HEALTH_DEFAULT}</Text>
+            <Text style={styles.muted}>
+              {legion.online
+                ? `Online — checked ${formatRelativeTime(new Date())}`
+                : legionLastSeen
+                  ? `Offline — last seen ${formatRelativeTime(legionLastSeen)}`
+                  : 'Offline'}
+            </Text>
           </View>
           <Badge tone={legion.online ? 'success' : 'danger'}>{legion.online ? 'Online' : 'Offline'}</Badge>
         </View>
@@ -419,6 +550,50 @@ function HomeScreen({ api, token, settings }) {
           <Button label="Wake" onPress={async () => { await api.wakeLegion(); load(); }} tone="secondary" />
           <Button label="Shutdown" onPress={confirmShutdown} tone="danger" />
         </View>
+      </Panel>
+
+      {/* MRR Panel (Baremetrics-style) */}
+      <Panel>
+        <Text style={styles.panelTitle}>Business Pulse</Text>
+        {mrrData && mrrData.total_mrr > 0 ? (
+          <>
+            <View style={styles.rowBetween} style={{ marginTop: 8 }}>
+              <Text style={[styles.statValue, { fontSize: 32 }]}>
+                ${Math.round(mrrData.total_mrr).toLocaleString()}
+              </Text>
+              <Text style={styles.muted}>/mo</Text>
+            </View>
+            <View style={[styles.statsGrid, { marginTop: 12 }]}>
+              <View style={styles.statCard}>
+                <Text style={[styles.statValue, { color: '#22c55e', fontSize: 18 }]}>
+                  +${Math.round(mrrData.new_mrr).toLocaleString()}
+                </Text>
+                <Text style={styles.muted}>new</Text>
+              </View>
+              <View style={styles.statCard}>
+                <Text style={[styles.statValue, { color: '#ef4444', fontSize: 18 }]}>
+                  -${Math.round(mrrData.churned_mrr).toLocaleString()}
+                </Text>
+                <Text style={styles.muted}>churned</Text>
+              </View>
+              <View style={styles.statCard}>
+                <Text style={[styles.statValue, { color: mrrData.net_change >= 0 ? '#22c55e' : '#ef4444', fontSize: 18 }]}>
+                  {mrrData.net_change >= 0 ? '+' : ''}${Math.round(mrrData.net_change).toLocaleString()}
+                </Text>
+                <Text style={styles.muted}>net</Text>
+              </View>
+            </View>
+            <View style={{ marginTop: 12, paddingTop: 12, borderTopWidth: 1, borderTopColor: '#123041' }}>
+              <Text style={styles.muted}>{mrrData.subscriber_count} active subscribers</Text>
+            </View>
+          </>
+        ) : (
+          <View style={{ paddingVertical: 12 }}>
+            <Text style={styles.muted}>
+              No active subscriptions yet — your MRR will show here once Sentinel Plus launches
+            </Text>
+          </View>
+        )}
       </Panel>
 
       <View style={styles.statsGrid}>
@@ -447,9 +622,15 @@ function HomeScreen({ api, token, settings }) {
             <View style={styles.listRow}>
               <View style={styles.flex}>
                 <Text style={styles.itemTitle}>{item.name || item.agent || 'Agent'}</Text>
-                <Text style={styles.muted}>{item.status || 'unknown'} - {compactTime(item.startedAt || item.started_at)}</Text>
+                <Text style={styles.muted}>
+                  {item.status === 'running'
+                    ? formatDuration(item.startedAt || item.started_at)
+                    : `${item.status === 'completed' ? 'Completed' : item.status === 'failed' ? 'Failed' : item.status || 'unknown'} ${formatRelativeTime(item.endedAt || item.ended_at || item.startedAt || item.started_at)}${item.status === 'failed' ? ' — tap to view logs' : ''}`}
+                </Text>
               </View>
-              <Button label="Stop" tone="danger" onPress={() => api.stopAgent(item.id || item.jobId).then(load).catch((err) => Alert.alert('Stop failed', err.message))} style={styles.smallButton} />
+              <Badge tone={item.status === 'running' ? 'success' : item.status === 'failed' ? 'danger' : 'muted'}>
+                {item.status || 'idle'}
+              </Badge>
             </View>
           )}
         />
@@ -952,14 +1133,122 @@ function SettingsScreen({ settings, setSettings, onLogout }) {
   );
 }
 
+// Universal Input Bar (Linear-style command bar)
+function UniversalInputBar({ api, settings, onNavigate, onIntentResult }) {
+  const [input, setInput] = useState('');
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [showOfflineWarning, setShowOfflineWarning] = useState(false);
+
+  const handleSend = async () => {
+    if (!input.trim() || isProcessing) return;
+    const userInput = input.trim();
+    setInput('');
+    setIsProcessing(true);
+
+    const result = await sendIntentToOllama(userInput, api, settings);
+
+    if (result.action === 'legion_offline') {
+      setShowOfflineWarning(true);
+      setTimeout(() => setShowOfflineWarning(false), 5000);
+    } else {
+      setShowOfflineWarning(false);
+
+      // Handle specific actions
+      if (result.action === 'wake_legion') {
+        try {
+          await api.wakeLegion();
+          onIntentResult?.({ success: true, message: 'Legion waking up...' });
+        } catch (err) {
+          onIntentResult?.({ success: false, message: 'Failed to wake Legion' });
+        }
+      } else if (result.action === 'shutdown_legion') {
+        try {
+          await api.shutdownLegion();
+          onIntentResult?.({ success: true, message: 'Legion shutting down...' });
+        } catch (err) {
+          onIntentResult?.({ success: false, message: 'Failed to shutdown Legion' });
+        }
+      } else if (result.action === 'approve_trade' && result.params?.ticker) {
+        onIntentResult?.({ success: true, message: `Navigating to approve ${result.params.ticker}...` });
+      }
+
+      // Navigate if needed
+      if (result.navigateTo) {
+        onNavigate?.(result.navigateTo, result.params);
+      }
+    }
+
+    setIsProcessing(false);
+  };
+
+  const handleWakeLegion = async () => {
+    setShowOfflineWarning(false);
+    try {
+      await api.wakeLegion();
+      onIntentResult?.({ success: true, message: 'Waking Legion...' });
+    } catch (err) {
+      onIntentResult?.({ success: false, message: 'Failed to wake Legion' });
+    }
+  };
+
+  const handleVoiceInput = () => {
+    Speech.speak('Voice input ready. Speak your command.', { rate: 0.95 });
+  };
+
+  return (
+    <View style={styles.universalInputContainer}>
+      {/* Offline warning */}
+      {showOfflineWarning && (
+        <View style={styles.universalInputOfflineWarning}>
+          <Text style={styles.universalInputOfflineText}>Legion is offline — wake it first</Text>
+          <Pressable style={styles.universalInputWakeButton} onPress={handleWakeLegion}>
+            <Text style={styles.universalInputWakeButtonText}>Wake</Text>
+          </Pressable>
+        </View>
+      )}
+
+      {/* Input bar */}
+      <View style={styles.universalInputRow}>
+        <TextInput
+          style={styles.universalInput}
+          placeholder="Type a command (e.g., 'wake legion', 'approve NVDA trade')..."
+          placeholderTextColor="#64748b"
+          value={input}
+          onChangeText={setInput}
+          onSubmitEditing={handleSend}
+          editable={!isProcessing}
+          multiline={false}
+        />
+        <Pressable style={styles.universalInputIconButton} onPress={handleVoiceInput} disabled={isProcessing}>
+          <Text style={styles.universalInputIcon}>🎤</Text>
+        </Pressable>
+        <Pressable
+          style={[styles.universalInputSendButton, (!input.trim() || isProcessing) && styles.universalInputSendButtonDisabled]}
+          onPress={handleSend}
+          disabled={!input.trim() || isProcessing}>
+          <Text style={styles.universalInputSendButtonText}>{isProcessing ? '...' : '→'}</Text>
+        </Pressable>
+      </View>
+    </View>
+  );
+}
+
 export default function App() {
   const [booting, setBooting] = useState(true);
   const [token, setToken] = useState(null);
   const [tab, setTab] = useState('home');
   const [settings, setSettings] = useState({ alpacaMode: 'paper', notifications: true, legionHealthUrl: LEGION_HEALTH_DEFAULT });
   const [claudePrompt, setClaudePrompt] = useState('');
+  const [toast, setToast] = useState(null);
   const lastLegionOnline = useRef(null);
   const api = useMemo(() => makeApi(token, settings), [token, settings]);
+
+  useEffect(() => {
+    if (toast) {
+      const timer = setTimeout(() => setToast(null), 3000);
+      return () => clearTimeout(timer);
+    }
+  }, [toast]);
 
   useEffect(() => {
     (async () => {
@@ -970,38 +1259,20 @@ export default function App() {
     })();
   }, []);
 
-  useEffect(() => {
-    if (!token || !settings.notifications) return;
-    (async () => {
-      const permission = await Notifications.requestPermissionsAsync();
-      if (!permission.granted) return;
-      const tokenResult = await Notifications.getExpoPushTokenAsync();
-      try {
-        await api.registerDevice(tokenResult.data);
-      } catch (err) {
-        console.warn('Device registration failed', err.message);
-      }
-    })();
-  }, [api, settings.notifications, token]);
+  // Handlers for Universal Input Bar
+  const handleNavigate = (targetTab, params) => {
+    setTab(targetTab);
+    if (targetTab === 'claude' && params?.description) {
+      setClaudePrompt(params.description);
+    }
+    if (targetTab === 'agents' && params?.description) {
+      safeStore.setItemAsync(SHARED_PROMPT_KEY, params.description);
+    }
+  };
 
-  useEffect(() => {
-    if (!token || !settings.notifications) return;
-    const timer = setInterval(async () => {
-      try {
-        await api.legionStatus();
-        lastLegionOnline.current = true;
-      } catch {
-        if (lastLegionOnline.current === true) {
-          await Notifications.scheduleNotificationAsync({
-            content: { title: 'Legion is offline', body: 'Legion went offline unexpectedly.', data: { screen: 'home' } },
-            trigger: null,
-          });
-        }
-        lastLegionOnline.current = false;
-      }
-    }, 30000);
-    return () => clearInterval(timer);
-  }, [api, settings.notifications, token]);
+  const handleIntentResult = (result) => {
+    setToast(result);
+  };
 
   const shareToAgent = async (text) => {
     await safeStore.setItemAsync(SHARED_PROMPT_KEY, text);
@@ -1040,6 +1311,22 @@ export default function App() {
         {tab === 'claude' ? <ClaudeScreen initialPrompt={claudePrompt} onShareToAgent={shareToAgent} /> : null}
         {tab === 'settings' ? <SettingsScreen settings={settings} setSettings={setSettings} onLogout={logout} /> : null}
       </View>
+
+      {/* Toast notification */}
+      {toast && (
+        <View style={[styles.toastContainer, { backgroundColor: toast.success ? '#064e3b' : '#7f1d1d' }]}>
+          <Text style={styles.toastText}>{toast.message}</Text>
+        </View>
+      )}
+
+      {/* Universal Input Bar (Linear-style command bar) */}
+      <UniversalInputBar
+        api={api}
+        settings={settings}
+        onNavigate={handleNavigate}
+        onIntentResult={handleIntentResult}
+      />
+
       <View style={styles.tabBar}>
         {TABS.map((item) => (
           <Pressable key={item.id} onPress={() => setTab(item.id)} style={[styles.tabItem, tab === item.id && styles.tabActive]}>
@@ -1183,4 +1470,92 @@ const styles = StyleSheet.create({
   tabActive: { backgroundColor: '#0b2b3f' },
   tabText: { color: '#94a3b8', fontSize: 12, fontWeight: '800' },
   tabTextActive: { color: '#5eead4' },
+
+  // Toast notification
+  toastContainer: {
+    position: 'absolute',
+    top: Platform.OS === 'ios' ? 70 : 50,
+    left: 20,
+    right: 20,
+    padding: 12,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#123041',
+    zIndex: 100,
+  },
+  toastText: { color: '#f8fafc', fontSize: 14, fontWeight: '700', textAlign: 'center' },
+
+  // Universal Input Bar (Linear-style command bar)
+  universalInputContainer: {
+    backgroundColor: '#071827',
+    borderTopWidth: 1,
+    borderTopColor: '#123041',
+    paddingHorizontal: 14,
+    paddingTop: 10,
+    paddingBottom: Platform.OS === 'ios' ? 8 : 10,
+  },
+  universalInputOfflineWarning: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: '#7f1d1d',
+    borderRadius: 8,
+    padding: 10,
+    marginBottom: 10,
+    borderWidth: 1,
+    borderColor: '#ef4444',
+  },
+  universalInputOfflineText: { color: '#fecaca', fontSize: 13, flex: 1 },
+  universalInputWakeButton: {
+    backgroundColor: '#0f766e',
+    borderRadius: 6,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderWidth: 1,
+    borderColor: '#2dd4bf',
+  },
+  universalInputWakeButtonText: { color: '#f8fafc', fontSize: 12, fontWeight: '700' },
+  universalInputRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    backgroundColor: '#0b1f31',
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#16364a',
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+  },
+  universalInput: {
+    flex: 1,
+    color: '#f8fafc',
+    fontSize: 15,
+    minHeight: 36,
+    paddingVertical: 4,
+  },
+  universalInputIconButton: {
+    width: 36,
+    height: 36,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 6,
+    backgroundColor: '#123041',
+  },
+  universalInputIcon: { fontSize: 18 },
+  universalInputSendButton: {
+    width: 44,
+    height: 36,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 6,
+    backgroundColor: '#0f766e',
+    borderWidth: 1,
+    borderColor: '#2dd4bf',
+  },
+  universalInputSendButtonDisabled: {
+    opacity: 0.5,
+    backgroundColor: '#123041',
+    borderColor: '#25465a',
+  },
+  universalInputSendButtonText: { color: '#f8fafc', fontSize: 18, fontWeight: '700' },
 });
